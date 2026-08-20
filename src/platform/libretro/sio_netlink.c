@@ -10,6 +10,18 @@
 
 #define NETLINK_PROTOCOL "gba-sio-1"
 
+/* The GameCube lead. A different conversation entirely from the link cable, so a
+ * different name: the bus refuses to join two ports that do not agree on one,
+ * which is what stops a link lead being pushed into a GameCube socket. */
+#define JOYLINK_PROTOCOL "gba-joy-1"
+
+/* A JOY bus byte takes eight bit-times on the wire, and mGBA's own Dolphin
+ * driver counts them at 115200 bits per second. That figure is wrong about the
+ * hardware and right about compatibility: it is what both ends of this protocol
+ * have always assumed, and the reply has to land where the asker expects it. */
+#define JOY_BITS_PER_SECOND 115200
+#define JOY_CYCLES_PER_BIT (GBA_ARM7TDMI_FREQUENCY / JOY_BITS_PER_SECOND)
+
 /* Rendezvous roughly every 15 microseconds of emulated time.
  *
  * The ceiling is the shortest transfer carried: 5755 cycles for two units at
@@ -60,7 +72,11 @@ enum {
 	NL_MODE = 1,
 	NL_XFER_START,
 	NL_XFER_DATA,
-	NL_LINES
+	NL_LINES,
+
+	/* The GameCube lead's two. It asks, this answers; nothing else crosses. */
+	NL_JOY_CMD,
+	NL_JOY_REPLY
 };
 #define NL_MSG_SIZE 12
 
@@ -334,6 +350,75 @@ static void _updateReady(struct GBASIONetlink* nl) {
 	sio->rcnt = GBASIORegisterRCNTSetSd(sio->rcnt, ready);
 }
 
+/* Answer one JOY bus command from the GameCube.
+ *
+ * mGBA already knows how: GBASIOJOYSendCommand takes the command byte and a
+ * four-byte payload, updates JOYCNT/JOYSTAT, raises the interrupt the game is
+ * waiting on, and hands back the reply to send. All that is missing is a way for
+ * the two machines to reach each other, which is what the bus is.
+ *
+ * The reply is stamped at the moment it would actually arrive rather than at
+ * once. A JOY bus exchange takes a known number of bit-times, and the GameCube
+ * times its own side against that; a reply that landed instantly would be one
+ * the asker is not yet listening for. */
+static void _answerJoy(struct GBASIONetlink* nl, const uint8_t* msg, uint64_t tick) {
+	uint8_t buffer[8];
+	uint8_t reply[NL_MSG_SIZE];
+	uint8_t command = msg[4];
+	int bits = 8;
+	int sent;
+
+	memset(buffer, 0, sizeof(buffer));
+	memcpy(buffer, &msg[5], 4);
+
+	switch (command) {
+	case JOY_RESET:
+	case JOY_POLL:
+		bits += 24;
+		break;
+	case JOY_RECV:
+	case JOY_TRANS:
+		bits += 40;
+		break;
+	default:
+		break;
+	}
+
+	sent = GBASIOJOYSendCommand(&nl->d, (enum GBASIOJOYCommand) command, buffer);
+	if (sent < 0) {
+		sent = 0;
+	}
+	if (sent > 5) {
+		sent = 5;
+	}
+
+	memset(reply, 0, sizeof(reply));
+	reply[0] = NL_JOY_REPLY;
+	reply[1] = (uint8_t) nl->selfId;
+	reply[4] = (uint8_t) sent;
+	memcpy(&reply[5], buffer, (size_t) sent);
+	nl->link->send(nl->joyPort, tick + (uint64_t) (bits * JOY_CYCLES_PER_BIT),
+	               RETRO_LINK_BROADCAST, reply, sizeof(reply));
+}
+
+
+/* Drain the GameCube port. Separate from the link cable's pump because the two
+ * ports carry different protocols and must never be read as one another. */
+static void _pumpJoy(struct GBASIONetlink* nl) {
+	uint8_t msg[NL_MSG_SIZE];
+	uint64_t tick;
+	unsigned from;
+	size_t len = sizeof(msg);
+
+	while (nl->link->recv(nl->joyPort, &tick, &from, msg, &len)) {
+		if (len == NL_MSG_SIZE && msg[0] == NL_JOY_CMD) {
+			_answerJoy(nl, msg, tick);
+		}
+		len = sizeof(msg);
+	}
+}
+
+
 static void _pump(struct GBASIONetlink* nl, uint32_t cyclesLate) {
 	uint8_t msg[NL_MSG_SIZE];
 	uint64_t tick;
@@ -426,6 +511,8 @@ void GBASIONetlinkCreate(struct GBASIONetlink* nl, const struct retro_link_inter
 
 	nl->link = link;
 	nl->port = port;
+	/* The GameCube lead's port sits beside the link cable's. */
+	nl->joyPort = port + 1;
 	nl->horizon = NETLINK_GRAIN;
 	nl->grain = NETLINK_GRAIN;
 	nl->mode = (enum GBASIOMode) -1;
@@ -436,6 +523,10 @@ void GBASIONetlinkDestroy(struct GBASIONetlink* nl) {
 	if (nl->attached && nl->link) {
 		nl->link->detach(nl->port);
 		nl->attached = false;
+	}
+	if (nl->joyAttached && nl->link) {
+		nl->link->detach(nl->joyPort);
+		nl->joyAttached = false;
 	}
 }
 
@@ -454,6 +545,13 @@ static bool GBASIONetlinkInit(struct GBASIODriver* driver) {
 	nl->attached = true;
 	nl->selfId = id;
 	_refreshPeers(nl);
+
+	/* The GameCube lead's port, alongside the link cable's. Attaching costs
+	 * nothing while nothing is cabled to it: an unjoined port bounds no one and
+	 * carries nothing, so a handheld that never meets a GameCube is unaffected. */
+	if (nl->link->attach(nl->joyPort, JOYLINK_PROTOCOL, GBA_ARM7TDMI_FREQUENCY) >= 0) {
+		nl->joyAttached = true;
+	}
 
 	mTimingSchedule(&driver->p->p->timing, &nl->event, (int32_t) nl->grain);
 	return true;
@@ -541,6 +639,11 @@ static bool GBASIONetlinkHandlesMode(struct GBASIODriver* driver, enum GBASIOMod
 
 static int GBASIONetlinkConnectedDevices(struct GBASIODriver* driver) {
 	struct GBASIONetlink* nl = (struct GBASIONetlink*) driver;
+	if (nl->mode == GBA_SIO_JOYBUS) {
+		/* A GameCube is one device on the other end, however many handhelds are
+		 * on the link cable. */
+		return nl->joyPeers >= 2 ? 1 : 0;
+	}
 	_refreshPeers(nl);
 	/* mGBA counts the other machines on the cable, not including this one. */
 	return nl->peers > 0 ? (int) (nl->peers - 1) : 0;
@@ -809,6 +912,27 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 	 * very message this core is about to want. */
 	grant = nl->link->advance(nl->port, now, now + nl->horizon, now + nl->grain);
 	_pump(nl, cyclesLate);
+
+	/* The GameCube lead, if one is in. Its own advance, because the bus bounds
+	 * each port separately and a console on one must not be held up by a
+	 * handheld on the other.
+	 *
+	 * This is where the socket version's clock channel went. Dolphin sends a
+	 * time slice down a second socket precisely because TCP has no shared clock;
+	 * the bus does, and converts between a GameCube's tick rate and a Game Boy
+	 * Advance's on the way past, so there is nothing left to send. */
+	if (nl->joyAttached) {
+		unsigned joyCount = 0;
+		if (nl->link->peers(nl->joyPort, &joyCount) >= 0) {
+			nl->joyPeers = joyCount;
+		} else {
+			nl->joyPeers = 0;
+		}
+		if (nl->joyPeers >= 2) {
+			nl->link->advance(nl->joyPort, now, now + nl->horizon, now + nl->grain);
+			_pumpJoy(nl);
+		}
+	}
 
 	/* Latch this machine's half once its clock reaches the transfer's start. */
 	if (nl->pendingStart && now >= nl->pendingTick) {

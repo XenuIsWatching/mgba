@@ -41,6 +41,23 @@ struct GBASIONetlink {
 	unsigned port;
 	bool attached;
 
+	/* The GameCube cable, on a port of its own.
+	 *
+	 * A GBA has one EXT socket and what is in it decides who it talks to: a link
+	 * lead to another handheld, or a GameCube lead to a console that treats it as
+	 * a controller with a screen. The two speak nothing in common -- one is a
+	 * symmetric exchange between equals, the other is a bus where the GameCube
+	 * asks and the GBA answers -- so they carry different protocol ids and the
+	 * bus refuses to join one to the other, which is the same refusal the room's
+	 * plug groups make with the sockets.
+	 *
+	 * Two bus ports rather than one because the id is fixed at attach and this
+	 * machine cannot know which lead someone is about to push in. The room picks
+	 * by seating a cable against one port or the other. */
+	unsigned joyPort;
+	bool joyAttached;
+	unsigned joyPeers;
+
 	/* Index on the bus. Player 0 owns the clock and is the only one that may
 	 * originate a transfer, matching real hardware. */
 	int selfId;
