@@ -47,6 +47,17 @@ struct GBASIONetlink {
 	 * Must stay below the shortest transfer it will carry, or a peer could
 	 * still be short of the point where it publishes its half of a transfer
 	 * when the transfer is due to complete. */
+	/* A monotonic 64-bit clock, accumulated from mGBA's 32-bit one.
+	 *
+	 * NOT mTimingGlobalTime, which looks like exactly the right thing and is a
+	 * trap: mTimingTick only advances globalCycles under ENABLE_DEBUGGERS, so in
+	 * a release core it reads zero for ever. mTimingCurrentTime is what mGBA's
+	 * own SIO drivers use, and it is an int32 that wraps, so the wraps are
+	 * accumulated here into something the bus can compare across machines. */
+	int32_t lastRaw;
+	bool haveRaw;
+	uint64_t nowBase;
+
 	uint64_t horizon;
 	uint64_t grain;
 

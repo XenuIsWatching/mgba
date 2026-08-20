@@ -61,7 +61,24 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 static void _updateReady(struct GBASIONetlink* nl);
 
 static uint64_t _now(struct GBASIONetlink* nl) {
-	return mTimingGlobalTime(&nl->d.p->p->timing);
+	int32_t raw = mTimingCurrentTime(&nl->d.p->p->timing);
+	int32_t delta;
+
+	if (!nl->haveRaw) {
+		nl->haveRaw = true;
+		nl->lastRaw = raw;
+		return nl->nowBase;
+	}
+
+	/* Signed difference, so the int32 wrapping round is just another step
+	 * forward. Called at least once a grain, so a delta can never come close to
+	 * needing more room than this. */
+	delta = raw - nl->lastRaw;
+	nl->lastRaw = raw;
+	if (delta > 0) {
+		nl->nowBase += (uint64_t) delta;
+	}
+	return nl->nowBase;
 }
 
 static void _refreshPeers(struct GBASIONetlink* nl) {
@@ -344,6 +361,12 @@ static void GBASIONetlinkReset(struct GBASIODriver* driver) {
 	nl->received = 0;
 	memset(nl->multiData, 0xFF, sizeof(nl->multiData));
 
+	/* A reset puts mGBA's cycle counter back to zero, which would read as an
+	 * enormous jump backwards. Re-anchor instead, keeping the accumulated total
+	 * moving forward so the bus never sees this machine's clock go back.
+	 */
+	nl->haveRaw = false;
+
 	/* Put the pump back on the schedule.
 	 *
 	 * GBAReset calls mTimingClear before it gets here, so every event booked in
@@ -513,8 +536,11 @@ static void GBASIONetlinkFinishMultiplayer(struct GBASIODriver* driver, uint16_t
 		data[i] = have ? nl->multiData[i] : 0xFFFF;
 	}
 
+	mLOG(GBA_SIO, DEBUG, "netlink: id %i xfer %04X %04X %04X %04X",
+	     nl->selfId, data[0], data[1], data[2], data[3]);
+
 	if (nl->received != ((1u << nl->peers) - 1)) {
-		mLOG(GBA_SIO, DEBUG, "MULTI transfer finished without every player's data");
+		mLOG(GBA_SIO, DEBUG, "netlink: id %i short: got %02X want %02X", nl->selfId, nl->received, (1u << nl->peers) - 1);
 	}
 
 	nl->received = 0;
