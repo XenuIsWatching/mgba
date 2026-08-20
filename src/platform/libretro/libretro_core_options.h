@@ -274,11 +274,11 @@ struct retro_core_option_v2_definition option_defs_us[] = {
       NULL,
       "system",
       {
-         { "OFF", "disabled" },
          { "ON",  "enabled" },
+         { "OFF", "disabled" },
          { NULL, NULL },
       },
-      "OFF"
+      "ON"
    },
    {
       "mgba_idle_optimization",

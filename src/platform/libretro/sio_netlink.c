@@ -228,8 +228,9 @@ static void _handleMessage(struct GBASIONetlink* nl, const uint8_t* msg, uint64_
  * touching the port again, which makes it look from the outside as though it
  * never asked.
  *
- * Ready means every machine on the cable is in the same mode as this one, which
- * is the same rule the in-process lockstep driver applies.
+ * The line is shared and pulled up, so it reads high unless a unit drags it low.
+ * Nothing here ever does, which is what mGBA reports with no driver installed and
+ * what its own lockstep driver reports for a lone player.
  */
 static void _updateReady(struct GBASIONetlink* nl) {
 	struct GBASIO* sio = nl->d.p;
@@ -240,27 +241,33 @@ static void _updateReady(struct GBASIONetlink* nl) {
 		return;
 	}
 
-	/* Ready as soon as the cable has someone else on it.
+	/* High, the way an undriven open-collector line reads.
 	 *
-	 * On hardware SD is a wire: the instant every unit is in multiplayer mode the
-	 * line is high, with no delay to speak of. Here a peer's mode has to cross
-	 * the bus, which costs at least a commit horizon, and the game samples this
-	 * bit within a few cycles of selecting the mode -- once, at boot, and it
-	 * remembers the answer. So consulting the peer's last ANNOUNCED mode reads a
-	 * value that is stale by exactly the wrong amount: the peer is a microsecond
-	 * behind on its way to the same mode, its previous mode says NORMAL, and the
-	 * game is told the connection is bad and never asks again.
+	 * SD is shared down the whole cable and pulled up: a unit drags it LOW to say
+	 * it is not ready, and nothing dragging it means ready. A machine with no
+	 * cable in the socket therefore reads ready, which is exactly what mGBA does
+	 * with no driver installed at all (GBASIOMultiplayerFillReady on the dummy
+	 * path) and what its own lockstep driver reports for a lone player.
 	 *
-	 * Peer COUNT, unlike peer mode, is known synchronously. Two machines on one
-	 * cable running the same game reach multiplayer mode within microseconds of
-	 * each other, so presence is the honest answer to "is anyone there" and the
-	 * staleness was an artefact of the transport rather than anything the guest
-	 * should see. A peer that really is in another mode still behaves correctly:
-	 * its half of a transfer fills with 0xFFFF, exactly as an unanswered cable
-	 * does.
+	 * This used to be "someone else is on the cable", which is stricter than both
+	 * and than the hardware, and it cost the feature its worst bug. A GBA reads
+	 * this bit once, while it boots, and caches the answer; machines in a room are
+	 * switched on one at a time, so the first one always read a zero no peer could
+	 * afterwards undo, and refused multiplayer for the rest of its session while
+	 * every count in the room said two. The only repair was to throw its game away
+	 * and boot it again.
+	 *
+	 * Pulling the line low would mean knowing a peer is in another mode, and a
+	 * peer's mode is only known as of its last announcement -- stale by a commit
+	 * horizon at the exact moment the guest samples this, which reads as a bad
+	 * connection when the peer is a microsecond behind on its way to the same
+	 * mode. An unanswered transfer already fills with 0xFFFF, which is how a cable
+	 * with nobody listening behaves on hardware too, so nothing is lost by
+	 * leaving the line where hardware leaves it.
 	 */
-	ready = nl->peers >= 2;
+	ready = true;
 	UNUSED(i);
+	UNUSED(nl->peers);
 
 	mLOG(GBA_SIO, DEBUG, "netlink: ready=%i (mode %i, peers %u)", (int) ready, (int) nl->mode, nl->peers);
 	sio->siocnt = GBASIOMultiplayerSetReady(sio->siocnt, ready);
@@ -496,6 +503,14 @@ static uint16_t GBASIONetlinkWriteRCNT(struct GBASIODriver* driver, uint16_t val
 
 	_refreshPeers(nl);
 	if (nl->peers < 2) {
+		/* Nothing on the other end, so nothing to wire: the guest reads back what
+		 * it wrote, which is what mGBA does in this mode with no driver at all.
+		 *
+		 * Floating the lines high here instead was tried, on the grounds that an
+		 * undriven line is pulled up and that is the more faithful reading. It
+		 * makes no difference to a game picking a cable up mid-session, so it is
+		 * not worth departing from the behavior every unlinked machine has had.
+		 */
 		return value;
 	}
 	return _wireLines(nl, value);
