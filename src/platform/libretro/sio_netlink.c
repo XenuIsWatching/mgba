@@ -64,8 +64,6 @@ enum {
 };
 #define NL_MSG_SIZE 12
 
-
-
 static void _write32(uint8_t* p, uint32_t v) {
 	p[0] = v & 0xFF;
 	p[1] = (v >> 8) & 0xFF;
