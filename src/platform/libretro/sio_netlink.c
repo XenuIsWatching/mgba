@@ -658,14 +658,17 @@ static bool GBASIONetlinkStart(struct GBASIODriver* driver) {
 		if (!GBASIONormalGetSc(nl->d.p->siocnt)) {
 			return false;
 		}
-		/* Two only. Normal mode chains SO to the next unit's SI and the last
-		 * unit's output goes nowhere, so a party of three has no meaning here,
-		 * and single-cartridge boot is a conversation between two machines
-		 * anyway. */
-		if (nl->peers != 2) {
-			mLOG(GBA_SIO, STUB, "Normal-mode transfer with %u machines on the cable", nl->peers);
-			return true;
-		}
+		/* Any party, not just a pair.
+		 *
+		 * Refusing above two was wrong about what single-cartridge boot is. A
+		 * host sends to up to three clients at once, and the protocol drops into
+		 * normal mode partway through however many are listening; declining
+		 * there let mGBA time the transfer locally and hand back the 0xFFFFFFFF
+		 * of an unanswered cable, so a party of three transferred the program
+		 * and then stalled with ERROR! on every screen.
+		 *
+		 * How the words are read is what changes with the party, and that is
+		 * _peerWord's business rather than this one's. */
 	}
 	if (nl->transferActive) {
 		mLOG(GBA_SIO, GAME_ERROR, "Transfer restarted unexpectedly");
@@ -753,10 +756,24 @@ static void GBASIONetlinkFinishMultiplayer(struct GBASIODriver* driver, uint16_t
 static uint32_t _peerWord(struct GBASIONetlink* nl, uint32_t empty) {
 	unsigned other;
 
-	if (nl->peers != 2 || nl->mode == GBA_SIO_MULTI) {
+	if (nl->peers < 2 || nl->mode == GBA_SIO_MULTI) {
 		return empty;
 	}
-	other = nl->selfId == 0 ? 1u : 0u;
+
+	if (nl->peers == 2) {
+		/* A pair is crossed: each unit's SO goes to the other's SI, so each
+		 * simply reads the other's word. */
+		other = nl->selfId == 0 ? 1u : 0u;
+	} else {
+		/* More than two is a CHAIN. SO goes to the next unit's SI down the
+		 * cable, so a unit reads the one before it, and the clock owner at the
+		 * head has nothing feeding its SI at all -- the last unit's output goes
+		 * nowhere. mGBA's own lockstep driver reads the same way. */
+		if (nl->selfId == 0) {
+			return empty;
+		}
+		other = (unsigned) nl->selfId - 1u;
+	}
 	if (!(nl->received & (1u << other))) {
 		mLOG(GBA_SIO, DEBUG, "netlink: normal transfer finished with no answer");
 		return empty;
