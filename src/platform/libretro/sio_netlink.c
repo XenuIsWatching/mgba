@@ -35,6 +35,7 @@ enum {
 };
 #define NL_MSG_SIZE 12
 
+
 static void _write32(uint8_t* p, uint32_t v) {
 	p[0] = v & 0xFF;
 	p[1] = (v >> 8) & 0xFF;
@@ -59,6 +60,8 @@ static bool GBASIONetlinkStart(struct GBASIODriver* driver);
 static void GBASIONetlinkFinishMultiplayer(struct GBASIODriver* driver, uint16_t data[4]);
 static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cyclesLate);
 static void _updateReady(struct GBASIONetlink* nl);
+static void _send(struct GBASIONetlink* nl, uint64_t tick, uint8_t type, uint32_t a, uint32_t b);
+static uint64_t _commitTick(struct GBASIONetlink* nl);
 
 static uint64_t _now(struct GBASIONetlink* nl) {
 	int32_t raw = mTimingCurrentTime(&nl->d.p->p->timing);
@@ -81,12 +84,41 @@ static uint64_t _now(struct GBASIONetlink* nl) {
 	return nl->nowBase;
 }
 
+/* React to the cable's membership having changed.
+ *
+ * Split out because _refreshPeers is called from seven places and the reaction
+ * used to live in only one of them, the driver's own event. Every other caller
+ * updated the count silently, so whichever ran first swallowed the change and
+ * the event then saw nothing to react to.
+ *
+ * That is not a rare race. GBASIOWriteSIOCNT asks the driver for deviceId and
+ * connectedDevices on EVERY write, and a game in multiplayer writes SIOCNT
+ * constantly, so the silent path nearly always won. Plugging a lead into two
+ * machines that were already running left both of them reading "all GBAs ready"
+ * as false for ever, and the game refuses multiplayer with a rejection noise.
+ * It only appeared to work when the cable was already seated at boot, because
+ * then setMode did the announcing instead. */
+static void _peersChanged(struct GBASIONetlink* nl) {
+	if (nl->attached) {
+		/* Say again what this machine is doing. Modes are announced when they
+		 * CHANGE, so a machine plugged in after the last change would otherwise
+		 * never hear one, and both ends would sit waiting to be told the other
+		 * was ready. */
+		_send(nl, _commitTick(nl), NL_MODE, (uint32_t) nl->mode, 0);
+	}
+	_updateReady(nl);
+}
+
 static void _refreshPeers(struct GBASIONetlink* nl) {
+	unsigned was = nl->peers;
 	unsigned count = 0;
 	int id = nl->link->peers(nl->port, &count);
 	if (id < 0) {
 		nl->selfId = 0;
 		nl->peers = 0;
+		if (was != 0) {
+			_peersChanged(nl);
+		}
 		return;
 	}
 	nl->selfId = id;
@@ -100,6 +132,10 @@ static void _refreshPeers(struct GBASIONetlink* nl) {
 		mLOG(GBA_SIO, WARN, "Link has %u machines on it; a GBA link cable carries %i", nl->peers, MAX_GBAS);
 		nl->peers = 0;
 		nl->selfId = 0;
+	}
+
+	if (nl->peers != was) {
+		_peersChanged(nl);
 	}
 }
 
@@ -584,20 +620,10 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 		_send(nl, now, NL_XFER_DATA, nl->multiData[nl->selfId], 0);
 	}
 
-	/* Say again what this machine is doing whenever the cable's membership
-	 * changes. Modes are announced when they CHANGE, so a machine plugged in
-	 * after the last change would otherwise never hear one, and both ends would
-	 * sit waiting to be told the other was ready. */
-	{
-		unsigned was = nl->peers;
-		_refreshPeers(nl);
-		if (nl->peers != was) {
-			if (nl->attached) {
-				_send(nl, now + nl->horizon, NL_MODE, (uint32_t) nl->mode, 0);
-			}
-			_updateReady(nl);
-		}
-	}
+	/* Membership is checked here as well as on the paths the guest drives,
+	 * because a cable seated while the game is not touching its serial port has
+	 * to be noticed too. _refreshPeers itself announces any change. */
+	_refreshPeers(nl);
 
 	if (grant != RETRO_LINK_UNBOUNDED && grant > now && grant - now < (uint64_t) step) {
 		step = (int32_t) (grant - now);
