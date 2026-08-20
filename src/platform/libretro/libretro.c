@@ -388,6 +388,15 @@ void retro_set_environment(retro_environment_t env) {
 
 	bool categoriesSupported;
 	libretro_set_core_options(environCallback, &categoriesSupported);
+
+#ifdef M_CORE_GBA
+	/* A Game Boy Advance with no cartridge is a real machine in a real state: the
+	 * BIOS draws its start-up animation and then waits on the link port for a
+	 * program to be sent to it, which is how single-cartridge multiplayer works.
+	 * Saying so here is what lets a frontend offer it. */
+	bool noGame = true;
+	environCallback(RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME, &noGame);
+#endif
 }
 
 void retro_set_video_refresh(retro_video_refresh_t video) {
@@ -867,8 +876,24 @@ void retro_reset(void) {
 }
 
 bool retro_load_game(const struct retro_game_info* game) {
-	struct VFile* rom;
-	if (game->data) {
+	struct VFile* rom = NULL;
+	if (!game || (!game->data && !game->path)) {
+#ifdef M_CORE_GBA
+		/* Nothing in the machine. There is no ROM to sniff a platform out of, so
+		 * the platform is chosen rather than detected, and Game Boy Advance is
+		 * the only one of the two this can mean: a Game Boy with no cartridge
+		 * shows a checkerboard and halts, while a GBA boots its BIOS and listens
+		 * on the link port for a program to run. */
+		core = GBACoreCreate();
+		if (!core) {
+			return false;
+		}
+		data = NULL;
+		dataSize = 0;
+#else
+		return false;
+#endif
+	} else if (game->data) {
 		data = anonymousMemoryMap(game->size);
 		dataSize = game->size;
 		memcpy(data, game->data, game->size);
@@ -879,15 +904,16 @@ bool retro_load_game(const struct retro_game_info* game) {
 		rom = VFileOpen(game->path, O_RDONLY);
 #endif
 	}
-	if (!rom) {
-		return false;
-	}
-
-	core = mCoreFindVF(rom);
 	if (!core) {
-		rom->close(rom);
-		mappedMemoryFree(data, game->size);
-		return false;
+		if (!rom) {
+			return false;
+		}
+		core = mCoreFindVF(rom);
+		if (!core) {
+			rom->close(rom);
+			mappedMemoryFree(data, game->size);
+			return false;
+		}
 	}
 	mCoreInitConfig(core, NULL);
 	core->init(core);
@@ -969,7 +995,9 @@ bool retro_load_game(const struct retro_game_info* game) {
 	memset(savedata, 0xFF, GBA_SIZE_FLASH1M);
 
 	_reloadSettings();
-	core->loadROM(core, rom);
+	if (rom) {
+		core->loadROM(core, rom);
+	}
 	deferredSetup = true;
 
 	const char* sysDir = 0;
@@ -1022,15 +1050,34 @@ bool retro_load_game(const struct retro_game_info* game) {
 	}
 #endif
 
+	bool haveBios = false;
 #ifdef ENABLE_VFS
-	if (core->opts.useBios && sysDir && biosName) {
+	if (sysDir && biosName) {
 		snprintf(biosPath, sizeof(biosPath), "%s%s%s", sysDir, PATH_SEP, biosName);
 		struct VFile* bios = VFileOpen(biosPath, O_RDONLY);
 		if (bios) {
-			core->loadBIOS(core, bios, 0);
+			/* With no cartridge the BIOS is the only code there is, so it is
+			 * loaded whether or not the player asked for it. Refusing here on the
+			 * strength of a preference would leave a machine with nothing to
+			 * execute. */
+			if (core->opts.useBios || !rom) {
+				core->loadBIOS(core, bios, 0);
+				haveBios = true;
+			} else {
+				bios->close(bios);
+			}
 		}
 	}
 #endif
+
+	if (!rom && !haveBios) {
+		/* An empty machine with no BIOS has nothing to run at all. Better to
+		 * refuse than to start something that can only sit at a black screen. */
+		mLOG(GBA_SIO, WARN, "No cartridge and no BIOS: put %s in the system directory", biosName);
+		core->deinit(core);
+		core = NULL;
+		return false;
+	}
 
 	core->reset(core);
 	_setupMaps(core);

@@ -23,6 +23,35 @@
  * rather than emulating. */
 #define NETLINK_GRAIN 256
 
+/* Rendezvous grain for a mode, in cycles.
+ *
+ * A transfer is announced a horizon ahead and must complete with every peer's
+ * half present, so the horizon has to stay well inside the SHORTEST transfer the
+ * mode can carry: multiplayer's is 5755 cycles, normal 32-bit's is 256, and
+ * normal 8-bit's is 64. One constant cannot serve both -- 256 is a comfortable
+ * twentieth of a multiplayer transfer and an entire normal one.
+ *
+ * A quarter of the shortest, which leaves room for a peer that is itself a
+ * horizon behind. Normal mode therefore rendezvouses four times as often as
+ * multiplayer, and that is a real cost paid only while a game is actually in
+ * normal mode: single-cartridge play is a burst of about a second, not a
+ * session, and the two machines are back on the coarse grain afterwards. */
+static uint64_t _grainForMode(enum GBASIOMode mode) {
+	switch (mode) {
+	case GBA_SIO_NORMAL_8:
+		return 16;
+	case GBA_SIO_NORMAL_32:
+		return 64;
+	default:
+		return NETLINK_GRAIN;
+	}
+}
+
+/* Whether this mode is one whose transfers cross the wire. */
+static bool _carried(enum GBASIOMode mode) {
+	return mode == GBA_SIO_MULTI || mode == GBA_SIO_NORMAL_8 || mode == GBA_SIO_NORMAL_32;
+}
+
 /* Bus message. Packed by hand rather than shipped as a struct: both ends are
  * the same build today, but protocol_id exists so that a GameCube core could
  * speak this later, and by then a shared struct layout would be an assumption
@@ -58,6 +87,8 @@ static uint16_t GBASIONetlinkWriteSIOCNT(struct GBASIODriver* driver, uint16_t v
 static uint16_t GBASIONetlinkWriteRCNT(struct GBASIODriver* driver, uint16_t value);
 static bool GBASIONetlinkStart(struct GBASIODriver* driver);
 static void GBASIONetlinkFinishMultiplayer(struct GBASIODriver* driver, uint16_t data[4]);
+static uint8_t GBASIONetlinkFinishNormal8(struct GBASIODriver* driver);
+static uint32_t GBASIONetlinkFinishNormal32(struct GBASIODriver* driver);
 static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cyclesLate);
 static void _updateReady(struct GBASIONetlink* nl);
 static void _send(struct GBASIONetlink* nl, uint64_t tick, uint8_t type, uint32_t a, uint32_t b);
@@ -107,6 +138,35 @@ static void _peersChanged(struct GBASIONetlink* nl) {
 		_send(nl, _commitTick(nl), NL_MODE, (uint32_t) nl->mode, 0);
 	}
 	_updateReady(nl);
+}
+
+/* The word this machine is offering, read from whichever register the current
+ * mode sends from. Latched at the transfer's start rather than kept up to date,
+ * because that is when the hardware takes it. */
+static uint32_t _localWord(struct GBASIONetlink* nl) {
+	struct GBA* gba = nl->d.p->p;
+	switch (nl->mode) {
+	case GBA_SIO_NORMAL_8:
+		return gba->memory.io[GBA_REG(SIODATA8)] & 0xFF;
+	case GBA_SIO_NORMAL_32:
+		return (uint32_t) gba->memory.io[GBA_REG(SIODATA32_LO)] |
+		       ((uint32_t) gba->memory.io[GBA_REG(SIODATA32_HI)] << 16);
+	default:
+		return gba->memory.io[GBA_REG(SIOMLT_SEND)];
+	}
+}
+
+/* Where this machine's word is kept, and where a peer's arrives. */
+static void _storeWord(struct GBASIONetlink* nl, unsigned index, uint32_t word) {
+	if (index >= MAX_GBAS) {
+		return;
+	}
+	if (nl->mode == GBA_SIO_MULTI) {
+		nl->multiData[index] = (uint16_t) word;
+	} else {
+		nl->normalData[index] = word;
+	}
+	nl->received |= 1u << index;
 }
 
 static void _refreshPeers(struct GBASIONetlink* nl) {
@@ -184,12 +244,16 @@ static void _handleMessage(struct GBASIONetlink* nl, const uint8_t* msg, uint64_
 		}
 		break;
 	case NL_XFER_START:
-		if (nl->selfId == 0) {
-			/* Only the clock owner starts transfers, so this is not ours. */
+		if (nl->mode == GBA_SIO_MULTI && nl->selfId == 0) {
+			/* In multiplayer only the clock owner starts transfers, so this is
+			 * not ours. Normal mode has no such rule: the clock belongs to
+			 * whichever unit is driving SC, which is a choice the GUEST makes in
+			 * SIOCNT and need not be the machine at the head of the cable. */
 			break;
 		}
 		nl->received = 0;
 		memset(nl->multiData, 0xFF, sizeof(nl->multiData));
+		memset(nl->normalData, 0xFF, sizeof(nl->normalData));
 
 		/* The word is NOT latched here. On hardware a child's SIOMLT_SEND is
 		 * taken when the master clocks it, at the transfer's start; this message
@@ -208,10 +272,7 @@ static void _handleMessage(struct GBASIONetlink* nl, const uint8_t* msg, uint64_
 		}
 		break;
 	case NL_XFER_DATA:
-		if (from < MAX_GBAS) {
-			nl->multiData[from] = (uint16_t) _read32(&msg[4]);
-			nl->received |= 1u << from;
-		}
+		_storeWord(nl, from, _read32(&msg[4]));
 		break;
 	default:
 		break;
@@ -356,6 +417,8 @@ void GBASIONetlinkCreate(struct GBASIONetlink* nl, const struct retro_link_inter
 	nl->d.writeRCNT = GBASIONetlinkWriteRCNT;
 	nl->d.start = GBASIONetlinkStart;
 	nl->d.finishMultiplayer = GBASIONetlinkFinishMultiplayer;
+	nl->d.finishNormal8 = GBASIONetlinkFinishNormal8;
+	nl->d.finishNormal32 = GBASIONetlinkFinishNormal32;
 
 	nl->event.context = nl;
 	nl->event.name = "GBA SIO Netlink";
@@ -431,6 +494,26 @@ static void GBASIONetlinkReset(struct GBASIODriver* driver) {
 static void GBASIONetlinkSetMode(struct GBASIODriver* driver, enum GBASIOMode mode) {
 	struct GBASIONetlink* nl = (struct GBASIONetlink*) driver;
 	nl->mode = mode;
+
+	/* The horizon follows the mode, because the shortest transfer does. Nothing
+	 * may be in flight across the change: a transfer announced under the old
+	 * horizon would complete under the new one, and the peer would be looking
+	 * for it at a different tick.
+	 *
+	 * The event is re-booked at the new grain straight away rather than at the
+	 * end of the one already scheduled. A machine dropping from multiplayer's
+	 * 256 into normal mode's 64 would otherwise spend its first three grains
+	 * blind, which is a whole normal-mode transfer. */
+	nl->transferActive = false;
+	nl->pendingStart = false;
+	nl->received = 0;
+	nl->grain = _grainForMode(mode);
+	nl->horizon = nl->grain;
+	if (nl->d.p && nl->d.p->p) {
+		mTimingDeschedule(&nl->d.p->p->timing, &nl->event);
+		mTimingSchedule(&nl->d.p->p->timing, &nl->event, (int32_t) nl->grain);
+	}
+
 	mLOG(GBA_SIO, DEBUG, "netlink: mode -> %i (peers %u, id %i)", (int) mode, nl->peers, nl->selfId);
 	if (nl->attached) {
 		_refreshPeers(nl);
@@ -475,7 +558,16 @@ static int GBASIONetlinkDeviceId(struct GBASIODriver* driver) {
  * does not handle the write, and the value the guest reads back is decided by
  * that path rather than by this one. */
 static uint16_t GBASIONetlinkWriteSIOCNT(struct GBASIODriver* driver, uint16_t value) {
-	UNUSED(driver);
+	struct GBASIONetlink* nl = (struct GBASIONetlink*) driver;
+
+	/* An unlinked machine in normal mode reads SI high, which is what mGBA does
+	 * with no driver installed. Worth restoring by hand because installing this
+	 * driver takes that dummy path away, and with the link option now on by
+	 * default that would reach every Game Boy Advance in the room rather than
+	 * only the cabled ones. */
+	if ((nl->mode == GBA_SIO_NORMAL_8 || nl->mode == GBA_SIO_NORMAL_32) && nl->peers < 2) {
+		value = GBASIONormalFillSi(value);
+	}
 	return value;
 }
 
@@ -524,11 +616,10 @@ static bool GBASIONetlinkStart(struct GBASIODriver* driver) {
 
 	_refreshPeers(nl);
 
-	if (nl->mode != GBA_SIO_MULTI) {
-		/* Multiplayer is the only mode carried. A normal-mode transfer can be as
-		 * short as 64 cycles, well under the commit horizon this relies on, so
-		 * letting mGBA time it locally and hand the guest the 0xFFFF of an
-		 * unanswered cable is more honest than carrying it badly. */
+	if (!_carried(nl->mode)) {
+		/* UART and JOY are not carried. Let mGBA time them and hand the guest the
+		 * 0xFFFF of an unanswered cable, which is more honest than carrying them
+		 * badly. */
 		return true;
 	}
 
@@ -537,9 +628,34 @@ static bool GBASIONetlinkStart(struct GBASIODriver* driver) {
 		 * back the 0xFFFF an unanswered cable gives. */
 		return true;
 	}
-	if (nl->selfId != 0) {
-		mLOG(GBA_SIO, DEBUG, "Secondary player attempted to start a transfer");
-		return false;
+
+	if (nl->mode == GBA_SIO_MULTI) {
+		if (nl->selfId != 0) {
+			mLOG(GBA_SIO, DEBUG, "Secondary player attempted to start a transfer");
+			return false;
+		}
+	} else {
+		/* Normal mode's clock owner is whichever unit is driving SC, which the
+		 * GUEST chooses in SIOCNT. It is NOT the machine at the head of the
+		 * cable: on a single-cartridge link the host drives the clock wherever it
+		 * happens to be plugged in, and the client has no cartridge to have an
+		 * opinion with.
+		 *
+		 * A unit on the external clock that reaches here has armed itself and is
+		 * waiting to be clocked. Nothing is scheduled for it: the master's start
+		 * message books its completion when it arrives, exactly as a multiplayer
+		 * child's is. */
+		if (!GBASIONormalIsInternalSc(nl->d.p->siocnt)) {
+			return false;
+		}
+		/* Two only. Normal mode chains SO to the next unit's SI and the last
+		 * unit's output goes nowhere, so a party of three has no meaning here,
+		 * and single-cartridge boot is a conversation between two machines
+		 * anyway. */
+		if (nl->peers != 2) {
+			mLOG(GBA_SIO, STUB, "Normal-mode transfer with %u machines on the cable", nl->peers);
+			return true;
+		}
 	}
 	if (nl->transferActive) {
 		mLOG(GBA_SIO, GAME_ERROR, "Transfer restarted unexpectedly");
@@ -552,8 +668,8 @@ static bool GBASIONetlinkStart(struct GBASIODriver* driver) {
 
 	nl->received = 0;
 	memset(nl->multiData, 0xFF, sizeof(nl->multiData));
-	nl->multiData[0] = nl->d.p->p->memory.io[GBA_REG(SIOMLT_SEND)];
-	nl->received |= 1u;
+	memset(nl->normalData, 0xFF, sizeof(nl->normalData));
+	_storeWord(nl, (unsigned) nl->selfId, _localWord(nl));
 
 	/* The finish time rides as the message's TICK, not in its body.
 	 *
@@ -576,7 +692,8 @@ static bool GBASIONetlinkStart(struct GBASIODriver* driver) {
 	 * machines, and the slave gets its finish by adding it to the converted tick
 	 * the start arrived on. */
 	_send(nl, commit, NL_XFER_START, (uint32_t) cycles, 0);
-	_send(nl, commit, NL_XFER_DATA, nl->multiData[0], 0);
+	_send(nl, commit, NL_XFER_DATA,
+	      nl->mode == GBA_SIO_MULTI ? nl->multiData[nl->selfId] : nl->normalData[nl->selfId], 0);
 
 	/* Completion is scheduled here rather than left to mGBA, because it has to
 	 * land on the horizon the peers were told about and not at the instant the
@@ -615,10 +732,49 @@ static void GBASIONetlinkFinishMultiplayer(struct GBASIODriver* driver, uint16_t
 	memset(nl->multiData, 0xFF, sizeof(nl->multiData));
 }
 
+/* What the other unit put on the wire, in normal mode.
+ *
+ * Normal mode is point to point: SO of one goes to SI of the other, both ways at
+ * once, so with two machines each simply reads the other's word. mGBA's own
+ * lockstep driver hands the clock owner nothing at all here, which is fine for a
+ * game that only ever talks downstream and useless for single-cartridge boot,
+ * where the host reads the client's answers the whole way through.
+ */
+static uint32_t _peerWord(struct GBASIONetlink* nl, uint32_t empty) {
+	unsigned other;
+
+	if (nl->peers != 2 || nl->mode == GBA_SIO_MULTI) {
+		return empty;
+	}
+	other = nl->selfId == 0 ? 1u : 0u;
+	if (!(nl->received & (1u << other))) {
+		mLOG(GBA_SIO, DEBUG, "netlink: normal transfer finished with no answer");
+		return empty;
+	}
+	return nl->normalData[other];
+}
+
+static uint8_t GBASIONetlinkFinishNormal8(struct GBASIODriver* driver) {
+	struct GBASIONetlink* nl = (struct GBASIONetlink*) driver;
+	uint8_t data = (uint8_t) _peerWord(nl, 0xFF);
+	nl->transferActive = false;
+	nl->received = 0;
+	return data;
+}
+
+static uint32_t GBASIONetlinkFinishNormal32(struct GBASIODriver* driver) {
+	struct GBASIONetlink* nl = (struct GBASIONetlink*) driver;
+	uint32_t data = _peerWord(nl, 0xFFFFFFFF);
+	nl->transferActive = false;
+	nl->received = 0;
+	return data;
+}
+
 static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cyclesLate) {
 	struct GBASIONetlink* nl = context;
 	uint64_t now = _now(nl);
 	uint64_t grant;
+	uint32_t word;
 	int32_t step = (int32_t) nl->grain;
 
 	/* Publish before reading. A peer parked on this core's horizon cannot move
@@ -630,9 +786,9 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 	/* Latch this machine's half once its clock reaches the transfer's start. */
 	if (nl->pendingStart && now >= nl->pendingTick) {
 		nl->pendingStart = false;
-		nl->multiData[nl->selfId] = nl->d.p->p->memory.io[GBA_REG(SIOMLT_SEND)];
-		nl->received |= 1u << nl->selfId;
-		_send(nl, now, NL_XFER_DATA, nl->multiData[nl->selfId], 0);
+		word = _localWord(nl);
+		_storeWord(nl, (unsigned) nl->selfId, word);
+		_send(nl, now, NL_XFER_DATA, word, 0);
 	}
 
 	/* Membership is checked here as well as on the paths the guest drives,

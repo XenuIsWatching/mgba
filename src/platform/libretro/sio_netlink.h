@@ -25,10 +25,13 @@ CXX_GUARD_START
  * to live in the frontend and the cores have to reach it through
  * RETRO_ENVIRONMENT_GET_LINK_INTERFACE.
  *
- * Only multiplayer mode is carried. The normal-mode and UART transfers are
- * short enough that the commit horizon this relies on would be longer than the
- * transfer itself, so handlesMode leaves them to mGBA's usual unlinked
- * behavior rather than pretending. */
+ * Multiplayer AND normal mode are carried; UART and JOY are not.
+ *
+ * Normal mode is what single-cartridge play runs over: the host sends a client
+ * with no cartridge at all a program to run out of its RAM, in 32-bit words.
+ * Those words are short -- 256 cycles against multiplayer's 5755 -- so normal
+ * mode cannot share multiplayer's commit horizon, and the horizon follows the
+ * mode rather than being one constant. */
 
 struct GBASIONetlink {
 	struct GBASIODriver d;
@@ -92,6 +95,12 @@ struct GBASIONetlink {
 	bool transferActive;
 	uint64_t finishTick;
 	uint16_t multiData[MAX_GBAS];
+
+	/* Normal mode's words, indexed the same way. Kept apart from multiData
+	 * because they are 32 bits wide and because a mode change must never have
+	 * one read as the other. */
+	uint32_t normalData[MAX_GBAS];
+
 	uint32_t received;
 };
 
