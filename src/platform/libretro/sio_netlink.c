@@ -65,6 +65,7 @@ enum {
 #define NL_MSG_SIZE 12
 
 
+
 static void _write32(uint8_t* p, uint32_t v) {
 	p[0] = v & 0xFF;
 	p[1] = (v >> 8) & 0xFF;
@@ -645,7 +646,18 @@ static bool GBASIONetlinkStart(struct GBASIODriver* driver) {
 		 * waiting to be clocked. Nothing is scheduled for it: the master's start
 		 * message books its completion when it arrives, exactly as a multiplayer
 		 * child's is. */
-		if (!GBASIONormalIsInternalSc(nl->d.p->siocnt)) {
+		/* Bit 0, SC, not bit 1.
+		 *
+		 * mGBA's names for these two do not line up with what they select.
+		 * GetSc is bit 0 and is the one that says "this unit drives the clock";
+		 * IsInternalSc is bit 1 and picks how FAST the internal clock runs, 256
+		 * kHz or 2 MHz, which is why GBASIOTransferCycles consults it and this
+		 * must not. Gating on the speed bit meant the clock owner was never
+		 * recognised: the host set SC and start, this armed it as a listener
+		 * instead and scheduled no completion at all, the transfer never
+		 * finished, and the game spun writing SIOCNT 0x1081 sixty-seven thousand
+		 * times waiting for a transfer that could not end. */
+		if (!GBASIONormalGetSc(nl->d.p->siocnt)) {
 			return false;
 		}
 		/* Two only. Normal mode chains SO to the next unit's SI and the last
