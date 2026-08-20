@@ -1,0 +1,66 @@
+/* Copyright (c) 2013-2026 Jeffrey Pfau
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef SIO_NETLINK_H
+#define SIO_NETLINK_H
+
+#include <mgba-util/common.h>
+
+CXX_GUARD_START
+
+#include <mgba/core/timing.h>
+#include <mgba/internal/gba/sio.h>
+
+#include "libretro.h"
+
+/* A GBA link cable carried by the frontend's link bus.
+ *
+ * This is GBASIOLockstepCoordinator's job done one level up. The coordinator
+ * is a shared structure behind a mutex, which works when several GBAs run
+ * inside one program, but a libretro frontend running two cores at once
+ * generally loads each from its own copy of the shared library. Two instances
+ * then share no globals whatsoever and cannot find each other, so the bus has
+ * to live in the frontend and the cores have to reach it through
+ * RETRO_ENVIRONMENT_GET_LINK_INTERFACE.
+ *
+ * Only multiplayer mode is carried. The normal-mode and UART transfers are
+ * short enough that the commit horizon this relies on would be longer than the
+ * transfer itself, so handlesMode leaves them to mGBA's usual unlinked
+ * behavior rather than pretending. */
+
+struct GBASIONetlink {
+	struct GBASIODriver d;
+	struct mTimingEvent event;
+
+	const struct retro_link_interface* link;
+	unsigned port;
+	bool attached;
+
+	/* Index on the bus. Player 0 owns the clock and is the only one that may
+	 * originate a transfer, matching real hardware. */
+	int selfId;
+	unsigned peers;
+
+	/* How far ahead of itself this core promises not to originate anything.
+	 * Must stay below the shortest transfer it will carry, or a peer could
+	 * still be short of the point where it publishes its half of a transfer
+	 * when the transfer is due to complete. */
+	uint64_t horizon;
+	uint64_t grain;
+
+	enum GBASIOMode mode;
+
+	bool transferActive;
+	uint64_t finishTick;
+	uint16_t multiData[MAX_GBAS];
+	uint32_t received;
+};
+
+void GBASIONetlinkCreate(struct GBASIONetlink*, const struct retro_link_interface* link, unsigned port);
+void GBASIONetlinkDestroy(struct GBASIONetlink*);
+
+CXX_GUARD_END
+
+#endif

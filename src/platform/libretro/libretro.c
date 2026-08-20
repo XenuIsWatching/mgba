@@ -26,6 +26,7 @@
 #include <mgba-util/memory.h>
 #include <mgba-util/vfs.h>
 
+#include "sio_netlink.h"
 #include "libretro_core_options.h"
 
 #define GB_SAMPLES 512
@@ -66,6 +67,15 @@ static int32_t _readTiltY(struct mRotationSource* source);
 static int32_t _readGyroZ(struct mRotationSource* source);
 
 static struct mCore* core;
+
+/* Link cable. The interface is fetched once in retro_init and stays valid
+ * for the life of the core, so linkInterface being non-NULL only means the
+ * frontend supports a link, never that anything is cabled to us: with no
+ * peers the bus grants without bound and the driver behaves exactly as an
+ * unplugged port does. */
+static const struct retro_link_interface* linkInterface = NULL;
+static struct GBASIONetlink netlink;
+static bool netlinkAttached = false;
 static mColor* outputBuffer = NULL;
 static int16_t *audioSampleBuffer = NULL;
 static size_t audioSampleBufferSize;
@@ -428,6 +438,8 @@ void retro_get_system_av_info(struct retro_system_av_info* info) {
 }
 
 void retro_init(void) {
+	struct retro_link_interface link;
+
 	enum retro_pixel_format fmt;
 #ifdef COLOR_16_BIT
 #ifdef COLOR_5_6_5
@@ -441,6 +453,18 @@ void retro_init(void) {
 	fmt = RETRO_PIXEL_FORMAT_XRGB8888;
 #endif
 	environCallback(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt);
+
+	/* Probe the experimental number first and the plain one after, so a core
+	 * built today keeps working against a frontend that has since adopted the
+	 * unflagged command. */
+	memset(&link, 0, sizeof(link));
+	if (environCallback(RETRO_ENVIRONMENT_GET_LINK_INTERFACE, &link) ||
+	    environCallback(RETRO_ENVIRONMENT_GET_LINK_INTERFACE_FINAL, &link)) {
+		static struct retro_link_interface stored;
+		stored = link;
+		linkInterface = &stored;
+	}
+
 
 	struct retro_input_descriptor inputDescriptors[] = {
 		{ 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A, "A" },
@@ -900,6 +924,19 @@ bool retro_load_game(const struct retro_game_info* game) {
 			internalAudioBufferSize = 0x4000;
 		}
 		core->setAudioBufferSize(core, internalAudioBufferSize);
+
+		/* Link cable. Attaching is what tells the bus this machine's serial
+		 * hardware is live; the frontend decides separately what it is cabled
+		 * to, so this is safe whether or not anything ever connects. */
+		if (linkInterface) {
+			struct retro_variable linkVar = { "mgba_link_cable", 0 };
+			if (environCallback(RETRO_ENVIRONMENT_GET_VARIABLE, &linkVar) && linkVar.value &&
+			    strcmp(linkVar.value, "enabled") == 0) {
+				GBASIONetlinkCreate(&netlink, linkInterface, 0);
+				GBASIOSetDriver(&((struct GBA*) core->board)->sio, &netlink.d);
+				netlinkAttached = true;
+			}
+		}
 	} else
 	#endif
 	{
@@ -997,6 +1034,13 @@ bool retro_load_game(const struct retro_game_info* game) {
 void retro_unload_game(void) {
 	if (!core) {
 		return;
+	}
+	/* Detach before the core goes away. GBASIOSetDriver's deinit path runs from
+	 * core->deinit below, but leaving an endpoint on the bus would hold up
+	 * whatever is cabled to it. Destroy is safe to call twice. */
+	if (netlinkAttached) {
+		GBASIONetlinkDestroy(&netlink);
+		netlinkAttached = false;
 	}
 	mCoreConfigDeinit(&core->config);
 	core->deinit(core);
