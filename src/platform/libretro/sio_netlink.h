@@ -79,6 +79,7 @@ struct GBASIONetlink {
 	 * its own and concludes it is alone. Low byte of RCNT: bits 0-3 the SC, SD,
 	 * SI and SO data, bits 4-7 their directions, 1 meaning driven. */
 	uint8_t lines;
+	bool linesPublished;
 	uint8_t peerLines[MAX_GBAS];
 	uint32_t peerLinesSeen;
 

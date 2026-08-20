@@ -372,6 +372,7 @@ static void GBASIONetlinkReset(struct GBASIODriver* driver) {
 	 * moving forward so the bus never sees this machine's clock go back.
 	 */
 	nl->haveRaw = false;
+	nl->linesPublished = false;
 
 	/* Put the pump back on the schedule.
 	 *
@@ -444,9 +445,16 @@ static uint16_t GBASIONetlinkWriteRCNT(struct GBASIODriver* driver, uint16_t val
 	}
 
 	/* Publish only when something actually changed. A game polling this line in
-	 * a tight loop would otherwise flood the bus with identical states. */
-	if (mine != nl->lines) {
+	 * a tight loop would otherwise flood the bus with identical states.
+	 *
+	 * The first write is always published, changed or not. A GBA boots by
+	 * writing RCNT with every line an input, whose low byte is zero, and zero
+	 * is also what this field starts at, so on the one reading either machine
+	 * actually performs, "nothing changed" was true and neither ever heard
+	 * from the other at all. */
+	if (mine != nl->lines || !nl->linesPublished) {
 		nl->lines = mine;
+		nl->linesPublished = true;
 		_send(nl, _commitTick(nl), NL_LINES, mine, 0);
 	}
 
