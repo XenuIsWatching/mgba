@@ -39,6 +39,13 @@ struct GBASIONetlink {
 
 	const struct retro_link_interface* link;
 	unsigned port;
+
+	/* What the frontend gave back at attach, and what every later call takes.
+	 *
+	 * Not a port number: the frontend has no way to tell one core from another
+	 * from a bare port, and working it out from the calling thread only holds
+	 * for a core that does everything on one. This holds for any of them. */
+	retro_link_handle_t handle;
 	bool attached;
 
 	/* The GameCube cable, on a port of its own.
@@ -55,6 +62,7 @@ struct GBASIONetlink {
 	 * machine cannot know which lead someone is about to push in. The room picks
 	 * by seating a cable against one port or the other. */
 	unsigned joyPort;
+	retro_link_handle_t joyHandle;
 	bool joyAttached;
 	unsigned joyPeers;
 

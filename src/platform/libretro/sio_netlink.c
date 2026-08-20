@@ -187,7 +187,7 @@ static void _storeWord(struct GBASIONetlink* nl, unsigned index, uint32_t word) 
 static void _refreshPeers(struct GBASIONetlink* nl) {
 	unsigned was = nl->peers;
 	unsigned count = 0;
-	int id = nl->link->peers(nl->port, &count);
+	int id = nl->link->peers(nl->handle, &count);
 	if (id < 0) {
 		nl->selfId = 0;
 		nl->peers = 0;
@@ -221,7 +221,7 @@ static void _send(struct GBASIONetlink* nl, uint64_t tick, uint8_t type, uint32_
 	msg[1] = (uint8_t) nl->selfId;
 	_write32(&msg[4], a);
 	_write32(&msg[8], b);
-	nl->link->send(nl->port, tick, RETRO_LINK_BROADCAST, msg, sizeof(msg));
+	nl->link->send(nl->handle, tick, RETRO_LINK_BROADCAST, msg, sizeof(msg));
 }
 
 /* The earliest tick this core may make something happen at. Deferring an
@@ -397,7 +397,7 @@ static void _answerJoy(struct GBASIONetlink* nl, const uint8_t* msg, uint64_t ti
 	reply[1] = (uint8_t) nl->selfId;
 	reply[4] = (uint8_t) sent;
 	memcpy(&reply[5], buffer, (size_t) sent);
-	nl->link->send(nl->joyPort, tick + (uint64_t) (bits * JOY_CYCLES_PER_BIT),
+	nl->link->send(nl->joyHandle, tick + (uint64_t) (bits * JOY_CYCLES_PER_BIT),
 	               RETRO_LINK_BROADCAST, reply, sizeof(reply));
 }
 
@@ -410,7 +410,7 @@ static void _pumpJoy(struct GBASIONetlink* nl) {
 	unsigned from;
 	size_t len = sizeof(msg);
 
-	while (nl->link->recv(nl->joyPort, &tick, &from, msg, &len)) {
+	while (nl->link->recv(nl->joyHandle, &tick, &from, msg, &len)) {
 		if (len == NL_MSG_SIZE && msg[0] == NL_JOY_CMD) {
 			_answerJoy(nl, msg, tick);
 		}
@@ -425,7 +425,7 @@ static void _pump(struct GBASIONetlink* nl, uint32_t cyclesLate) {
 	unsigned from;
 	size_t len = sizeof(msg);
 
-	while (nl->link->recv(nl->port, &tick, &from, msg, &len)) {
+	while (nl->link->recv(nl->handle, &tick, &from, msg, &len)) {
 		if (len == NL_MSG_SIZE) {
 			_handleMessage(nl, msg, tick, from, cyclesLate);
 		}
@@ -521,35 +521,33 @@ void GBASIONetlinkCreate(struct GBASIONetlink* nl, const struct retro_link_inter
 
 void GBASIONetlinkDestroy(struct GBASIONetlink* nl) {
 	if (nl->attached && nl->link) {
-		nl->link->detach(nl->port);
+		nl->link->detach(nl->handle);
 		nl->attached = false;
 	}
 	if (nl->joyAttached && nl->link) {
-		nl->link->detach(nl->joyPort);
+		nl->link->detach(nl->joyHandle);
 		nl->joyAttached = false;
 	}
 }
 
 static bool GBASIONetlinkInit(struct GBASIODriver* driver) {
 	struct GBASIONetlink* nl = (struct GBASIONetlink*) driver;
-	int id;
-
 	if (!nl->link) {
 		return false;
 	}
 
-	id = nl->link->attach(nl->port, NETLINK_PROTOCOL, GBA_ARM7TDMI_FREQUENCY);
-	if (id < 0) {
+	nl->handle = nl->link->attach(nl->port, NETLINK_PROTOCOL, GBA_ARM7TDMI_FREQUENCY);
+	if (!nl->handle) {
 		return false;
 	}
 	nl->attached = true;
-	nl->selfId = id;
 	_refreshPeers(nl);
 
 	/* The GameCube lead's port, alongside the link cable's. Attaching costs
 	 * nothing while nothing is cabled to it: an unjoined port bounds no one and
 	 * carries nothing, so a handheld that never meets a GameCube is unaffected. */
-	if (nl->link->attach(nl->joyPort, JOYLINK_PROTOCOL, GBA_ARM7TDMI_FREQUENCY) >= 0) {
+	nl->joyHandle = nl->link->attach(nl->joyPort, JOYLINK_PROTOCOL, GBA_ARM7TDMI_FREQUENCY);
+	if (nl->joyHandle) {
 		nl->joyAttached = true;
 	}
 
@@ -910,7 +908,7 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 	/* Publish before reading. A peer parked on this core's horizon cannot move
 	 * until it has been told the horizon moved, and it may be sitting on the
 	 * very message this core is about to want. */
-	grant = nl->link->advance(nl->port, now, now + nl->horizon, now + nl->grain);
+	grant = nl->link->advance(nl->handle, now, now + nl->horizon, now + nl->grain);
 	_pump(nl, cyclesLate);
 
 	/* The GameCube lead, if one is in. Its own advance, because the bus bounds
@@ -923,13 +921,13 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 	 * Advance's on the way past, so there is nothing left to send. */
 	if (nl->joyAttached) {
 		unsigned joyCount = 0;
-		if (nl->link->peers(nl->joyPort, &joyCount) >= 0) {
+		if (nl->link->peers(nl->joyHandle, &joyCount) >= 0) {
 			nl->joyPeers = joyCount;
 		} else {
 			nl->joyPeers = 0;
 		}
 		if (nl->joyPeers >= 2) {
-			nl->link->advance(nl->joyPort, now, now + nl->horizon, now + nl->grain);
+			nl->link->advance(nl->joyHandle, now, now + nl->horizon, now + nl->grain);
 			_pumpJoy(nl);
 		}
 	}
