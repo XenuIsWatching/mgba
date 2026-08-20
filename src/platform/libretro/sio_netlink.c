@@ -63,6 +63,16 @@ static void _refreshPeers(struct GBASIONetlink* nl) {
 	}
 	nl->selfId = id;
 	nl->peers = count;
+
+	/* The bus is protocol-agnostic and will happily join five machines; a GBA
+	 * multiplayer link carries four. Refuse the extra rather than indexing off
+	 * the end of multiData or asking GBASIOTransferCycles for a device count it
+	 * rejects, both of which turn a mis-cabled room into corrupt transfers. */
+	if (nl->peers > MAX_GBAS || nl->selfId >= MAX_GBAS) {
+		mLOG(GBA_SIO, WARN, "Link has %u machines on it; a GBA link cable carries %i", nl->peers, MAX_GBAS);
+		nl->peers = 0;
+		nl->selfId = 0;
+	}
 }
 
 static void _send(struct GBASIONetlink* nl, uint64_t tick, uint8_t type, uint32_t a, uint32_t b) {
