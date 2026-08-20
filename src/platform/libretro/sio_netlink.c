@@ -23,7 +23,8 @@
 enum {
 	NL_MODE = 1,
 	NL_XFER_START,
-	NL_XFER_DATA
+	NL_XFER_DATA,
+	NL_LINES
 };
 #define NL_MSG_SIZE 12
 
@@ -136,6 +137,12 @@ static void _handleMessage(struct GBASIONetlink* nl, const uint8_t* msg, unsigne
 		_send(nl, _commitTick(nl), NL_XFER_DATA, nl->multiData[nl->selfId], 0);
 		_scheduleFinish(nl, finish, cyclesLate);
 		break;
+	case NL_LINES:
+		if (from < MAX_GBAS) {
+			nl->peerLines[from] = (uint8_t) _read32(&msg[4]);
+			nl->peerLinesSeen |= 1u << from;
+		}
+		break;
 	case NL_XFER_DATA:
 		if (from < MAX_GBAS) {
 			nl->multiData[from] = (uint16_t) _read32(&msg[4]);
@@ -159,6 +166,61 @@ static void _pump(struct GBASIONetlink* nl, uint32_t cyclesLate) {
 		}
 		len = sizeof(msg);
 	}
+}
+
+/* This machine's four data lines as the cable leaves them.
+ *
+ * SO of one unit goes to SI of the next, so SI is read from the peer that
+ * drives SO. SC and SD are common lines shared down the whole cable, so they
+ * read low if ANY unit pulls them low and high otherwise, which is what an open
+ * collector bus does. A line nobody drives floats high, exactly as it does with
+ * no cable in the socket, so an unlinked machine is unaffected.
+ */
+static uint16_t _wireLines(struct GBASIONetlink* nl, uint16_t value) {
+	unsigned i;
+	bool sc = true;
+	bool sd = true;
+	bool si = true;
+
+	/* This machine's own contribution to the shared lines. */
+	if (value & (1 << 4)) {         /* SC driven */
+		sc = sc && !!(value & (1 << 0));
+	}
+	if (value & (1 << 5)) {         /* SD driven */
+		sd = sd && !!(value & (1 << 1));
+	}
+
+	for (i = 0; i < MAX_GBAS; ++i) {
+		uint8_t peer;
+		if (!(nl->peerLinesSeen & (1u << i)) || (int) i == nl->selfId) {
+			continue;
+		}
+		peer = nl->peerLines[i];
+		if (peer & (1 << 4)) {
+			sc = sc && !!(peer & (1 << 0));
+		}
+		if (peer & (1 << 5)) {
+			sd = sd && !!(peer & (1 << 1));
+		}
+		/* SI comes from whoever is driving SO into it. With two machines that is
+		 * simply the other one. */
+		if (peer & (1 << 7)) {
+			si = si && !!(peer & (1 << 3));
+		}
+	}
+
+	/* Only the lines this machine is READING are replaced; the ones it drives
+	 * read back what it wrote, as they do on hardware. */
+	if (!(value & (1 << 4))) {
+		value = (value & ~(uint16_t) (1 << 0)) | (sc ? (1 << 0) : 0);
+	}
+	if (!(value & (1 << 5))) {
+		value = (value & ~(uint16_t) (1 << 1)) | (sd ? (1 << 1) : 0);
+	}
+	if (!(value & (1 << 6))) {
+		value = (value & ~(uint16_t) (1 << 2)) | (si ? (1 << 2) : 0);
+	}
+	return value;
 }
 
 void GBASIONetlinkCreate(struct GBASIONetlink* nl, const struct retro_link_interface* link, unsigned port) {
@@ -287,8 +349,25 @@ static uint16_t GBASIONetlinkWriteSIOCNT(struct GBASIODriver* driver, uint16_t v
 }
 
 static uint16_t GBASIONetlinkWriteRCNT(struct GBASIODriver* driver, uint16_t value) {
-	UNUSED(driver);
-	return value;
+	struct GBASIONetlink* nl = (struct GBASIONetlink*) driver;
+	uint8_t mine = (uint8_t) (value & 0xFF);
+
+	if (!nl->attached) {
+		return value;
+	}
+
+	/* Publish only when something actually changed. A game polling this line in
+	 * a tight loop would otherwise flood the bus with identical states. */
+	if (mine != nl->lines) {
+		nl->lines = mine;
+		_send(nl, _commitTick(nl), NL_LINES, mine, 0);
+	}
+
+	_refreshPeers(nl);
+	if (nl->peers < 2) {
+		return value;
+	}
+	return _wireLines(nl, value);
 }
 
 static bool GBASIONetlinkStart(struct GBASIODriver* driver) {

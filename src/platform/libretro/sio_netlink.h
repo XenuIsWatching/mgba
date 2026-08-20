@@ -52,6 +52,15 @@ struct GBASIONetlink {
 
 	enum GBASIOMode mode;
 
+	/* General-purpose line state, which is how a game finds out whether anything
+	 * is on the other end at all. A GBA boots into GPIO mode, drives SO and reads
+	 * SI, and decides from that; without the peer's lines it only ever reads back
+	 * its own and concludes it is alone. Low byte of RCNT: bits 0-3 the SC, SD,
+	 * SI and SO data, bits 4-7 their directions, 1 meaning driven. */
+	uint8_t lines;
+	uint8_t peerLines[MAX_GBAS];
+	uint32_t peerLinesSeen;
+
 	bool transferActive;
 	uint64_t finishTick;
 	uint16_t multiData[MAX_GBAS];
