@@ -930,8 +930,15 @@ bool retro_load_game(const struct retro_game_info* game) {
 		 * to, so this is safe whether or not anything ever connects. */
 		if (linkInterface) {
 			struct retro_variable linkVar = { "mgba_link_cable", 0 };
+			/* "ON", not "enabled". A core option value pairs a VALUE with a
+			 * LABEL, and GET_VARIABLE hands back the value; "enabled" is only
+			 * what the frontend prints beside it. Every other switch in this
+			 * core compares against "ON" for that reason. Comparing against the
+			 * label meant the option could never be turned on from a menu at
+			 * all, while a test that wrote "enabled" into the options file by
+			 * hand -- a value this option does not even offer -- passed. */
 			if (environCallback(RETRO_ENVIRONMENT_GET_VARIABLE, &linkVar) && linkVar.value &&
-			    strcmp(linkVar.value, "enabled") == 0) {
+			    strcmp(linkVar.value, "ON") == 0) {
 				GBASIONetlinkCreate(&netlink, linkInterface, 0);
 				GBASIOSetDriver(&((struct GBA*) core->board)->sio, &netlink.d);
 				netlinkAttached = true;
