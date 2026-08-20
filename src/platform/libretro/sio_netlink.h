@@ -82,6 +82,12 @@ struct GBASIONetlink {
 	uint8_t peerLines[MAX_GBAS];
 	uint32_t peerLinesSeen;
 
+	/* A transfer the master has announced but whose start tick this machine has
+	 * not reached yet. Its word is latched when it gets there, not when the
+	 * message arrives. */
+	bool pendingStart;
+	uint64_t pendingTick;
+
 	bool transferActive;
 	uint64_t finishTick;
 	uint16_t multiData[MAX_GBAS];

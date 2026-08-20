@@ -154,10 +154,15 @@ static void _handleMessage(struct GBASIONetlink* nl, const uint8_t* msg, uint64_
 		}
 		nl->received = 0;
 		memset(nl->multiData, 0xFF, sizeof(nl->multiData));
-		nl->multiData[nl->selfId] = nl->d.p->p->memory.io[GBA_REG(SIOMLT_SEND)];
-		nl->received |= 1u << nl->selfId;
 
-		_send(nl, _commitTick(nl), NL_XFER_DATA, nl->multiData[nl->selfId], 0);
+		/* The word is NOT latched here. On hardware a child's SIOMLT_SEND is
+		 * taken when the master clocks it, at the transfer's start; this message
+		 * can arrive up to a whole horizon before that moment, and latching on
+		 * arrival hands over whatever the child had written for the PREVIOUS
+		 * round. That reads as a child repeating itself for ever while the
+		 * master waits for it to move on. */
+		nl->pendingStart = true;
+		nl->pendingTick = tick;
 		_scheduleFinish(nl, tick + (uint64_t) _read32(&msg[4]), cyclesLate);
 		break;
 	case NL_LINES:
@@ -358,6 +363,7 @@ static void GBASIONetlinkDeinit(struct GBASIODriver* driver) {
 static void GBASIONetlinkReset(struct GBASIODriver* driver) {
 	struct GBASIONetlink* nl = (struct GBASIONetlink*) driver;
 	nl->transferActive = false;
+	nl->pendingStart = false;
 	nl->received = 0;
 	memset(nl->multiData, 0xFF, sizeof(nl->multiData));
 
@@ -536,8 +542,11 @@ static void GBASIONetlinkFinishMultiplayer(struct GBASIODriver* driver, uint16_t
 		data[i] = have ? nl->multiData[i] : 0xFFFF;
 	}
 
-	mLOG(GBA_SIO, DEBUG, "netlink: id %i xfer %04X %04X %04X %04X",
-	     nl->selfId, data[0], data[1], data[2], data[3]);
+	mLOG(GBA_SIO, DEBUG, "netlink: id %i siocnt %04X irq %i busy %i ready %i si %i xfer %04X %04X",
+	     nl->selfId, driver->p->siocnt,
+	     (int) !!(driver->p->siocnt & 0x4000), (int) !!(driver->p->siocnt & 0x0080),
+	     (int) !!(driver->p->siocnt & 0x0008), (int) !!(driver->p->siocnt & 0x0004),
+	     data[0], data[1]);
 
 	if (nl->received != ((1u << nl->peers) - 1)) {
 		mLOG(GBA_SIO, DEBUG, "netlink: id %i short: got %02X want %02X", nl->selfId, nl->received, (1u << nl->peers) - 1);
@@ -558,6 +567,14 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 	 * very message this core is about to want. */
 	grant = nl->link->advance(nl->port, now, now + nl->horizon, now + nl->grain);
 	_pump(nl, cyclesLate);
+
+	/* Latch this machine's half once its clock reaches the transfer's start. */
+	if (nl->pendingStart && now >= nl->pendingTick) {
+		nl->pendingStart = false;
+		nl->multiData[nl->selfId] = nl->d.p->p->memory.io[GBA_REG(SIOMLT_SEND)];
+		nl->received |= 1u << nl->selfId;
+		_send(nl, now, NL_XFER_DATA, nl->multiData[nl->selfId], 0);
+	}
 
 	/* Say again what this machine is doing whenever the cable's membership
 	 * changes. Modes are announced when they CHANGE, so a machine plugged in
