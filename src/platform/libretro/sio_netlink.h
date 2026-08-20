@@ -52,6 +52,16 @@ struct GBASIONetlink {
 
 	enum GBASIOMode mode;
 
+	/* What each machine on the cable is doing, this one included.
+	 *
+	 * SIOCNT bit 3 is the "all GBAs ready" flag, and GBATEK is explicit that it
+	 * is hardware-driven and read-only: a game selects multiplayer mode and then
+	 * READS that bit to decide whether anyone is out there. Nothing writes it, so
+	 * the driver has to keep it true, which means knowing what every peer is up
+	 * to. Ready means all of them are in the same mode as this one. */
+	enum GBASIOMode peerModes[MAX_GBAS];
+	uint32_t peerModesSeen;
+
 	/* General-purpose line state, which is how a game finds out whether anything
 	 * is on the other end at all. A GBA boots into GPIO mode, drives SO and reads
 	 * SI, and decides from that; without the peer's lines it only ever reads back

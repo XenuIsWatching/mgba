@@ -10,11 +10,18 @@
 
 #define NETLINK_PROTOCOL "gba-sio-1"
 
-/* Rendezvous roughly every 61 microseconds of emulated time. Small enough to
- * stay well inside the shortest multiplayer transfer this carries (5755
- * cycles, two units at 115200 baud), large enough that two cores are not
- * stopping to talk every few instructions. */
-#define NETLINK_GRAIN 1024
+/* Rendezvous roughly every 15 microseconds of emulated time.
+ *
+ * The ceiling is the shortest transfer carried: 5755 cycles for two units at
+ * 115200 baud. The horizon is also how far the two machines may drift apart, and
+ * a transfer's two halves have to meet inside it, so a quarter of the shortest
+ * transfer leaves room for the reply to arrive before the master finishes.
+ * At 1024 a good share of transfers completed with only one half present.
+ *
+ * The floor is cost: every grain is a rendezvous between two threads, so this
+ * cannot go much lower without both cores spending their time synchronising
+ * rather than emulating. */
+#define NETLINK_GRAIN 256
 
 /* Bus message. Packed by hand rather than shipped as a struct: both ends are
  * the same build today, but protocol_id exists so that a GameCube core could
@@ -51,6 +58,7 @@ static uint16_t GBASIONetlinkWriteRCNT(struct GBASIODriver* driver, uint16_t val
 static bool GBASIONetlinkStart(struct GBASIODriver* driver);
 static void GBASIONetlinkFinishMultiplayer(struct GBASIODriver* driver, uint16_t data[4]);
 static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cyclesLate);
+static void _updateReady(struct GBASIONetlink* nl);
 
 static uint64_t _now(struct GBASIONetlink* nl) {
 	return mTimingGlobalTime(&nl->d.p->p->timing);
@@ -112,30 +120,28 @@ static void _scheduleFinish(struct GBASIONetlink* nl, uint64_t finishTick, uint3
 	mTimingSchedule(&sio->p->timing, &sio->completeEvent, delay);
 }
 
-static void _handleMessage(struct GBASIONetlink* nl, const uint8_t* msg, unsigned from, uint32_t cyclesLate) {
-	uint64_t finish;
+static void _handleMessage(struct GBASIONetlink* nl, const uint8_t* msg, uint64_t tick, unsigned from, uint32_t cyclesLate) {
 
 	switch (msg[0]) {
 	case NL_MODE:
-		/* Nothing to enforce. A peer sitting in another mode simply never
-		 * produces data, and the transfer fills with 0xFFFF exactly the way an
-		 * unanswered cable does. */
+		if (from < MAX_GBAS) {
+			nl->peerModes[from] = (enum GBASIOMode) _read32(&msg[4]);
+			nl->peerModesSeen |= 1u << from;
+			_updateReady(nl);
+		}
 		break;
 	case NL_XFER_START:
 		if (nl->selfId == 0) {
 			/* Only the clock owner starts transfers, so this is not ours. */
 			break;
 		}
-		finish = (uint64_t) _read32(&msg[4]);
-		finish |= (uint64_t) _read32(&msg[8]) << 32;
-
 		nl->received = 0;
 		memset(nl->multiData, 0xFF, sizeof(nl->multiData));
 		nl->multiData[nl->selfId] = nl->d.p->p->memory.io[GBA_REG(SIOMLT_SEND)];
 		nl->received |= 1u << nl->selfId;
 
 		_send(nl, _commitTick(nl), NL_XFER_DATA, nl->multiData[nl->selfId], 0);
-		_scheduleFinish(nl, finish, cyclesLate);
+		_scheduleFinish(nl, tick + (uint64_t) _read32(&msg[4]), cyclesLate);
 		break;
 	case NL_LINES:
 		if (from < MAX_GBAS) {
@@ -154,6 +160,55 @@ static void _handleMessage(struct GBASIONetlink* nl, const uint8_t* msg, unsigne
 	}
 }
 
+/* Keep SIOCNT's "all GBAs ready" flag true, and RCNT's SD line with it.
+ *
+ * GBATEK: SIOCNT bit 3 reads "0=Bad connection, 1=All GBAs Ready" and is
+ * read-only, driven by hardware. A game selects multiplayer mode and then READS
+ * that bit to find out whether anyone is on the other end. Nothing ever writes
+ * it, so a driver that does not maintain it leaves it reading zero for ever, and
+ * the game refuses to start multiplayer -- with a rejection noise, and without
+ * touching the port again, which makes it look from the outside as though it
+ * never asked.
+ *
+ * Ready means every machine on the cable is in the same mode as this one, which
+ * is the same rule the in-process lockstep driver applies.
+ */
+static void _updateReady(struct GBASIONetlink* nl) {
+	struct GBASIO* sio = nl->d.p;
+	unsigned i;
+	bool ready;
+
+	if (!sio || nl->mode != GBA_SIO_MULTI) {
+		return;
+	}
+
+	/* Ready as soon as the cable has someone else on it.
+	 *
+	 * On hardware SD is a wire: the instant every unit is in multiplayer mode the
+	 * line is high, with no delay to speak of. Here a peer's mode has to cross
+	 * the bus, which costs at least a commit horizon, and the game samples this
+	 * bit within a few cycles of selecting the mode -- once, at boot, and it
+	 * remembers the answer. So consulting the peer's last ANNOUNCED mode reads a
+	 * value that is stale by exactly the wrong amount: the peer is a microsecond
+	 * behind on its way to the same mode, its previous mode says NORMAL, and the
+	 * game is told the connection is bad and never asks again.
+	 *
+	 * Peer COUNT, unlike peer mode, is known synchronously. Two machines on one
+	 * cable running the same game reach multiplayer mode within microseconds of
+	 * each other, so presence is the honest answer to "is anyone there" and the
+	 * staleness was an artefact of the transport rather than anything the guest
+	 * should see. A peer that really is in another mode still behaves correctly:
+	 * its half of a transfer fills with 0xFFFF, exactly as an unanswered cable
+	 * does.
+	 */
+	ready = nl->peers >= 2;
+	UNUSED(i);
+
+	mLOG(GBA_SIO, DEBUG, "netlink: ready=%i (mode %i, peers %u)", (int) ready, (int) nl->mode, nl->peers);
+	sio->siocnt = GBASIOMultiplayerSetReady(sio->siocnt, ready);
+	sio->rcnt = GBASIORegisterRCNTSetSd(sio->rcnt, ready);
+}
+
 static void _pump(struct GBASIONetlink* nl, uint32_t cyclesLate) {
 	uint8_t msg[NL_MSG_SIZE];
 	uint64_t tick;
@@ -162,7 +217,7 @@ static void _pump(struct GBASIONetlink* nl, uint32_t cyclesLate) {
 
 	while (nl->link->recv(nl->port, &tick, &from, msg, &len)) {
 		if (len == NL_MSG_SIZE) {
-			_handleMessage(nl, msg, from, cyclesLate);
+			_handleMessage(nl, msg, tick, from, cyclesLate);
 		}
 		len = sizeof(msg);
 	}
@@ -303,8 +358,11 @@ static void GBASIONetlinkReset(struct GBASIODriver* driver) {
 static void GBASIONetlinkSetMode(struct GBASIODriver* driver, enum GBASIOMode mode) {
 	struct GBASIONetlink* nl = (struct GBASIONetlink*) driver;
 	nl->mode = mode;
+	mLOG(GBA_SIO, DEBUG, "netlink: mode -> %i (peers %u, id %i)", (int) mode, nl->peers, nl->selfId);
 	if (nl->attached) {
+		_refreshPeers(nl);
 		_send(nl, _commitTick(nl), NL_MODE, (uint32_t) mode, 0);
+		_updateReady(nl);
 	}
 }
 
@@ -409,7 +467,27 @@ static bool GBASIONetlinkStart(struct GBASIODriver* driver) {
 	nl->multiData[0] = nl->d.p->p->memory.io[GBA_REG(SIOMLT_SEND)];
 	nl->received |= 1u;
 
-	_send(nl, commit, NL_XFER_START, (uint32_t) (finish & 0xFFFFFFFFu), (uint32_t) (finish >> 32));
+	/* The finish time rides as the message's TICK, not in its body.
+	 *
+	 * Ticks are counted from each machine's own power-on, so an absolute one put
+	 * in the payload means nothing at the other end: the bus converts the tick
+	 * FIELD between timelines and cannot convert bytes it is only carrying. Sent
+	 * as a raw number it had every transfer completing at a meaningless moment,
+	 * and every one of them finished without the other half's data. So the start
+	 * is stamped at the transfer's finish and the body carries only how long the
+	 * transfer takes, which is a duration and means the same on both machines. */
+	/* Both stamped at the commit tick, start first.
+	 *
+	 * The inbox is ordered by tick, so stamping the start at the FINISH tick put
+	 * it behind the data: the slave stored the master's half, then processed the
+	 * start, which resets the transfer and threw that half away. Every transfer
+	 * then finished a player short.
+	 *
+	 * The duration goes in the body instead. It is a count of cycles rather than
+	 * a moment, so unlike an absolute tick it means the same thing on both
+	 * machines, and the slave gets its finish by adding it to the converted tick
+	 * the start arrived on. */
+	_send(nl, commit, NL_XFER_START, (uint32_t) cycles, 0);
 	_send(nl, commit, NL_XFER_DATA, nl->multiData[0], 0);
 
 	/* Completion is scheduled here rather than left to mGBA, because it has to
@@ -436,7 +514,7 @@ static void GBASIONetlinkFinishMultiplayer(struct GBASIODriver* driver, uint16_t
 	}
 
 	if (nl->received != ((1u << nl->peers) - 1)) {
-		mLOG(GBA_SIO, WARN, "MULTI transfer finished without every player's data");
+		mLOG(GBA_SIO, DEBUG, "MULTI transfer finished without every player's data");
 	}
 
 	nl->received = 0;
@@ -454,6 +532,21 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 	 * very message this core is about to want. */
 	grant = nl->link->advance(nl->port, now, now + nl->horizon, now + nl->grain);
 	_pump(nl, cyclesLate);
+
+	/* Say again what this machine is doing whenever the cable's membership
+	 * changes. Modes are announced when they CHANGE, so a machine plugged in
+	 * after the last change would otherwise never hear one, and both ends would
+	 * sit waiting to be told the other was ready. */
+	{
+		unsigned was = nl->peers;
+		_refreshPeers(nl);
+		if (nl->peers != was) {
+			if (nl->attached) {
+				_send(nl, now + nl->horizon, NL_MODE, (uint32_t) nl->mode, 0);
+			}
+			_updateReady(nl);
+		}
+	}
 
 	if (grant != RETRO_LINK_UNBOUNDED && grant > now && grant - now < (uint64_t) step) {
 		step = (int32_t) (grant - now);
