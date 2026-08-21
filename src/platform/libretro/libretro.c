@@ -27,6 +27,7 @@
 #include <mgba-util/vfs.h>
 
 #include "sio_netlink.h"
+#include "gb_sio_netlink.h"
 #include "libretro_core_options.h"
 
 #define GB_SAMPLES 512
@@ -76,6 +77,28 @@ static struct mCore* core;
 static const struct retro_link_interface* linkInterface = NULL;
 static struct GBASIONetlink netlink;
 static bool netlinkAttached = false;
+#ifdef M_CORE_GB
+/* The Game Boy's own, on its own driver interface. mGBA's Game Boy is a separate
+ * core with a separate serial port, so a Game Boy Advance cable's driver reaches
+ * none of it: a lead between two Game Boys run by this core carried nothing at
+ * all until this existed. */
+static struct GBSIONetlink gbNetlink;
+static bool gbNetlinkAttached = false;
+#endif
+
+/* Whether the player asked for a cable.
+ *
+ * "ON", not "enabled". A core option value pairs a VALUE with a LABEL, and
+ * GET_VARIABLE hands back the value; "enabled" is only what the frontend prints
+ * beside it. Every other switch in this core compares against "ON" for that
+ * reason. Comparing against the label meant the option could never be turned on
+ * from a menu at all, while a test that wrote "enabled" into the options file by
+ * hand -- a value this option does not even offer -- passed. */
+static bool _linkWanted(void) {
+	struct retro_variable linkVar = { "mgba_link_cable", 0 };
+	return environCallback(RETRO_ENVIRONMENT_GET_VARIABLE, &linkVar) && linkVar.value &&
+	       strcmp(linkVar.value, "ON") == 0;
+}
 static mColor* outputBuffer = NULL;
 static int16_t *audioSampleBuffer = NULL;
 static size_t audioSampleBufferSize;
@@ -954,21 +977,10 @@ bool retro_load_game(const struct retro_game_info* game) {
 		/* Link cable. Attaching is what tells the bus this machine's serial
 		 * hardware is live; the frontend decides separately what it is cabled
 		 * to, so this is safe whether or not anything ever connects. */
-		if (linkInterface) {
-			struct retro_variable linkVar = { "mgba_link_cable", 0 };
-			/* "ON", not "enabled". A core option value pairs a VALUE with a
-			 * LABEL, and GET_VARIABLE hands back the value; "enabled" is only
-			 * what the frontend prints beside it. Every other switch in this
-			 * core compares against "ON" for that reason. Comparing against the
-			 * label meant the option could never be turned on from a menu at
-			 * all, while a test that wrote "enabled" into the options file by
-			 * hand -- a value this option does not even offer -- passed. */
-			if (environCallback(RETRO_ENVIRONMENT_GET_VARIABLE, &linkVar) && linkVar.value &&
-			    strcmp(linkVar.value, "ON") == 0) {
-				GBASIONetlinkCreate(&netlink, linkInterface, 0);
-				GBASIOSetDriver(&((struct GBA*) core->board)->sio, &netlink.d);
-				netlinkAttached = true;
-			}
+		if (linkInterface && _linkWanted()) {
+			GBASIONetlinkCreate(&netlink, linkInterface, 0);
+			GBASIOSetDriver(&((struct GBA*) core->board)->sio, &netlink.d);
+			netlinkAttached = true;
 		}
 	} else
 	#endif
@@ -985,6 +997,17 @@ bool retro_load_game(const struct retro_game_info* game) {
 		audioSampleBuffer = malloc(audioSampleBufferSize * sizeof(int16_t));
 		audioSamplesPerFrameAvg = GB_SAMPLES;
 		core->setAudioBufferSize(core, GB_SAMPLES);
+
+#ifdef M_CORE_GB
+		/* Link cable. Attaching is what tells the bus this machine's serial
+		 * hardware is live; the frontend decides separately what it is cabled
+		 * to, so this is safe whether or not anything ever connects. */
+		if (linkInterface && _linkWanted()) {
+			GBSIONetlinkCreate(&gbNetlink, linkInterface, 0);
+			GBSIOSetDriver(&((struct GB*) core->board)->sio, &gbNetlink.d);
+			gbNetlinkAttached = true;
+		}
+#endif
 	}
 
 	core->setAVStream(core, &stream);
@@ -1096,6 +1119,12 @@ void retro_unload_game(void) {
 		GBASIONetlinkDestroy(&netlink);
 		netlinkAttached = false;
 	}
+#ifdef M_CORE_GB
+	if (gbNetlinkAttached) {
+		GBSIONetlinkDestroy(&gbNetlink);
+		gbNetlinkAttached = false;
+	}
+#endif
 	mCoreConfigDeinit(&core->config);
 	core->deinit(core);
 	mappedMemoryFree(data, dataSize);

@@ -35,6 +35,26 @@
  * rather than emulating. */
 #define NETLINK_GRAIN 256
 
+/* And how often to look when there is nothing to look FOR.
+ *
+ * The grain above is sized so that the two halves of a transfer meet inside the
+ * horizon. That constraint only exists while a transfer can actually happen: a
+ * port with nobody on the far end has nothing to be late for, and the fine
+ * grain is then pure overhead paid every 256 cycles for ever.
+ *
+ * Measured, on Four Swords Adventures with four handhelds: each machine's SIO
+ * port made 9.8 MILLION calls into the bus over one run and blocked for zero
+ * milliseconds in all of them, because no link lead was in it. Across four
+ * handhelds that is 39 million round trips through the coordinator's lock,
+ * competing with the ports that had real work to do. The audio crackled.
+ *
+ * A frame's worth of cycles, near enough. A cable seated while the link is idle
+ * is noticed within one frame, which is far quicker than a hand can move, and
+ * _refreshPeers drops straight back to the fine grain the moment anyone
+ * appears. */
+#define NETLINK_IDLE_GRAIN 4096
+
+
 /* Rendezvous grain for a mode, in cycles.
  *
  * A transfer is announced a horizon ahead and must complete with every peer's
@@ -908,7 +928,14 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 	/* Publish before reading. A peer parked on this core's horizon cannot move
 	 * until it has been told the horizon moved, and it may be sitting on the
 	 * very message this core is about to want. */
-	grant = nl->link->advance(nl->handle, now, now + nl->horizon, now + nl->grain);
+	/* Only when somebody is on this wire. An uncabled port's advance returns
+	 * unbounded every time, and the only thing it costs is the lock it takes to
+	 * say so -- millions of times over a session. */
+	if (nl->peers >= 2 || nl->transferActive || nl->pendingStart) {
+		grant = nl->link->advance(nl->handle, now, now + nl->horizon, now + nl->grain);
+	} else {
+		grant = RETRO_LINK_UNBOUNDED;
+	}
 	_pump(nl, cyclesLate);
 
 	/* The GameCube lead, if one is in. Its own advance, because the bus bounds
@@ -944,6 +971,12 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 	 * because a cable seated while the game is not touching its serial port has
 	 * to be noticed too. _refreshPeers itself announces any change. */
 	_refreshPeers(nl);
+
+	/* Coarsen while there is nothing on either wire and nothing in flight. The
+	 * checks are cheap and local; the thing being avoided is not. */
+	if (!nl->transferActive && !nl->pendingStart && nl->peers < 2 && nl->joyPeers < 2) {
+		step = NETLINK_IDLE_GRAIN;
+	}
 
 	if (grant != RETRO_LINK_UNBOUNDED && grant > now && grant - now < (uint64_t) step) {
 		step = (int32_t) (grant - now);
