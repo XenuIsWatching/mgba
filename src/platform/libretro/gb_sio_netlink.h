@@ -60,7 +60,7 @@ struct GBSIONetlink {
 	 * Not a port number: the frontend has no way to tell one core from another
 	 * from a bare port, and working it out from the calling thread only holds
 	 * for a core that does everything on one. */
-	retro_link_handle_t handle;
+	retro_link_port_t *handle;
 	bool attached;
 
 	int selfId;
