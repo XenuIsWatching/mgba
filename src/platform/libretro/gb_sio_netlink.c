@@ -297,6 +297,7 @@ static void _acceptClock(struct GBSIONetlink* nl) {
 	mTimingSchedule(&gb->timing, &sio->event, period * (2 - gb->doubleSpeed));
 
 	nl->clockReady = false;
+	nl->fastSeen = nl->clockFast;
 	nl->busy = true;
 	nl->busyUntil = _now(nl) + _transferTicks(nl, nl->clockFast);
 	nl->published = false;
@@ -353,6 +354,25 @@ static bool GBSIONetlinkInit(struct GBSIODriver* driver) {
 	nl->reannounceUntil = 0;
 	nl->clockReady = false;
 	nl->busy = false;
+	nl->fastSeen = false;
+
+	/* The peer's register goes too. What this holds was learned on a timeline
+	 * that has just been thrown away -- the counter re-anchors here and anything
+	 * queued for this machine is dropped -- so it is a byte from a previous life
+	 * rather than evidence about the wire now.
+	 *
+	 * Not because the line reads 0xFF: the peer is still plugged in and still
+	 * driving it, and real hardware would give whatever its shift register holds.
+	 * It is that gambatte's driver clears this here, and two drivers sharing one
+	 * cable must not disagree about what a reset means.
+	 *
+	 * Costs one transfer. The peer says its register again as soon as it is next
+	 * clocked, because being clocked is itself a change it publishes. No
+	 * assertion on a screen can see a single transfer, so nothing in the probe
+	 * covers this -- it is a parity rule, not a measured bug. */
+	nl->peerSb = 0xFF;
+	nl->peerArmed = false;
+
 	_refreshPeers(nl);
 
 	/* Put the pump on the schedule. GBSIOReset calls GBSIOSetDriver, which comes
