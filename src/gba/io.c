@@ -1001,6 +1001,13 @@ uint16_t GBAIORead(struct GBA* gba, uint32_t address) {
 
 void GBAIOSerialize(struct GBA* gba, struct GBASerializedState* state) {
 	int i;
+	/* GBAIORead answers RCNT and SIOCNT from sio->, so io[] is only a mirror of
+	 * them and nothing keeps it in step. The guest cannot tell, but the libretro
+	 * memory map publishes io[] while the loop below stores what GBAIORead
+	 * returns, so a state loads into a machine whose io[] differs from the one
+	 * it was taken from -- by bits no emulation puts back. Reconcile them. */
+	gba->memory.io[GBA_REG(RCNT)] = gba->sio.rcnt;
+	gba->memory.io[GBA_REG(SIOCNT)] = gba->sio.siocnt;
 	for (i = 0; i < GBA_REG_INTERNAL_MAX; i += 2) {
 		if (_isRSpecialRegister[i >> 1]) {
 			STORE_16(gba->memory.io[i >> 1], i, state->io);
