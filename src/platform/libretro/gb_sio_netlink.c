@@ -221,7 +221,7 @@ static void _pump(struct GBSIONetlink* nl) {
 	}
 
 	while (nl->link->recv(nl->handle, &tick, &from, buf, &len)) {
-			if (len == GBNL_MSG_SIZE) {
+		if (len == GBNL_MSG_SIZE) {
 			struct GBSIONetlinkMessage msg;
 			msg.tick = tick;
 			msg.type = buf[0];

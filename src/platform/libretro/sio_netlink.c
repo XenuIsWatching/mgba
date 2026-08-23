@@ -344,7 +344,6 @@ static void _handleMessage(struct GBASIONetlink* nl, const uint8_t* msg, uint64_
  */
 static void _updateReady(struct GBASIONetlink* nl) {
 	struct GBASIO* sio = nl->d.p;
-	unsigned i;
 	bool ready;
 
 	if (!sio || nl->mode != GBA_SIO_MULTI) {
@@ -376,8 +375,6 @@ static void _updateReady(struct GBASIONetlink* nl) {
 	 * leaving the line where hardware leaves it.
 	 */
 	ready = true;
-	UNUSED(i);
-	UNUSED(nl->peers);
 
 	mLOG(GBA_SIO, DEBUG, "netlink: ready=%i (mode %i, peers %u)", (int) ready, (int) nl->mode, nl->peers);
 	sio->siocnt = GBASIOMultiplayerSetReady(sio->siocnt, ready);
