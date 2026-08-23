@@ -270,7 +270,7 @@ struct retro_core_option_v2_definition option_defs_us[] = {
       "mgba_link_cable",
       "Link Cable (Restart)",
       NULL,
-      "Emulate a link cable between this Game Boy Advance and another one running in the same frontend, for multiplayer games such as Mario Kart: Super Circuit. The frontend decides which machines are cabled together and must support the link interface; where it does not, this does nothing. Multiplayer mode only.",
+      "Emulate a link cable between this machine and another Game Boy Advance or Game Boy running in the same frontend, for multiplayer games such as Mario Kart: Super Circuit, and for sending a game to a system with no cartridge in it. The frontend decides which machines are cabled together and must support the link interface; where it does not, this does nothing.",
       NULL,
       "system",
       {
