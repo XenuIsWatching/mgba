@@ -165,12 +165,26 @@ static uint64_t _now(struct GBASIONetlink* nl) {
  * It only appeared to work when the cable was already seated at boot, because
  * then setMode did the announcing instead. */
 static void _peersChanged(struct GBASIONetlink* nl) {
+	/* Forget the other end. What was on the wire a moment ago is not evidence
+	 * about what is on it now: a lead that has moved may be joining two different
+	 * machines, and these arrays are indexed by the bus slot, which a frontend is
+	 * free to hand to whoever plugs in next. Left standing, a departed machine's
+	 * SC/SD/SI would go on colouring what _wireLines gives the guest out of RCNT
+	 * until its replacement happened to write that register -- and a GBA writes
+	 * RCNT while it boots and then leaves it alone for the rest of the session. */
+	memset(nl->peerModes, 0, sizeof(nl->peerModes));
+	nl->peerModesSeen = 0;
+	memset(nl->peerLines, 0, sizeof(nl->peerLines));
+	nl->peerLinesSeen = 0;
+
 	if (nl->attached) {
-		/* Say again what this machine is doing. Modes are announced when they
-		 * CHANGE, so a machine plugged in after the last change would otherwise
-		 * never hear one, and both ends would sit waiting to be told the other
-		 * was ready. */
+		/* Say everything again. Both are announced when they CHANGE, so a machine
+		 * plugged in after the last change would otherwise never hear one, and
+		 * both ends would sit waiting to be told the other was ready. The peers
+		 * this machine just forgot are owed the same, and cannot be relied on to
+		 * volunteer it: they are subject to the RCNT silence above too. */
 		_send(nl, _commitTick(nl), NL_MODE, (uint32_t) nl->mode, 0);
+		_send(nl, _commitTick(nl), NL_LINES, nl->lines, 0);
 	}
 	_updateReady(nl);
 }
