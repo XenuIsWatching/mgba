@@ -1095,10 +1095,38 @@ bool retro_load_game(const struct retro_game_info* game) {
 
 	if (!rom && !haveBios) {
 		/* An empty machine with no BIOS has nothing to run at all. Better to
-		 * refuse than to start something that can only sit at a black screen. */
+		 * refuse than to start something that can only sit at a black screen.
+		 *
+		 * Everything a load sets up has to come down by hand here. This is the
+		 * only failure that can be reached after the allocating has begun, and
+		 * clearing the core below is also what stops retro_unload_game from ever
+		 * running: it gives up at once on a null core. Leaving the endpoint would
+		 * be the worst of it -- it would hold its slot on the bus, in front of a
+		 * core that no longer exists, for as long as the frontend stays open. */
 		mLOG(GBA_SIO, WARN, "No cartridge and no BIOS: put %s in the system directory", biosName);
+		if (netlinkAttached) {
+			GBASIONetlinkDestroy(&netlink);
+			netlinkAttached = false;
+		}
+#ifdef M_CORE_GB
+		if (gbNetlinkAttached) {
+			GBSIONetlinkDestroy(&gbNetlink);
+			gbNetlinkAttached = false;
+		}
+#endif
+		mCoreConfigDeinit(&core->config);
 		core->deinit(core);
 		core = NULL;
+		mappedMemoryFree(savedata, GBA_SIZE_FLASH1M);
+		savedata = 0;
+		/* Not retro_deinit's to free after all: a frontend is free to offer
+		 * another game once this one has been refused, and the next load would
+		 * overwrite both pointers before it ever got the chance. */
+		free(outputBuffer);
+		outputBuffer = NULL;
+		free(audioSampleBuffer);
+		audioSampleBuffer = NULL;
+		audioSampleBufferSize = 0;
 		return false;
 	}
 
