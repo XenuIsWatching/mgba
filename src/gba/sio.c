@@ -191,6 +191,19 @@ void GBASIOWriteSIOCNT(struct GBASIO* sio, uint16_t value) {
 		sio->rcnt = GBASIORegisterRCNTFillSc(sio->rcnt);
 
 		if (GBASIOMultiplayerIsBusy(value) && !GBASIOMultiplayerIsBusy(sio->siocnt)) {
+			// Same reason as the normal-mode case below: a driver's start()
+			// reads this register, and until here it holds the previous write.
+			// Multiplayer's baud is bits 0-1, and a driver sizes the transfer
+			// from them, so a game that sets baud and start together had its
+			// transfer timed at the baud it just stopped using. That one is
+			// quieter than the normal-mode fault and worse when it bites: the
+			// length decides the finish tick the clock owner publishes to every
+			// peer, so a wrong one desyncs the party rather than refusing it.
+			//
+			// After the edge test, which still needs the old value. NOT hoisted
+			// above the switch, which would break that test and the normal-mode
+			// one at the same time.
+			sio->siocnt = value;
 			if (!id) {
 				sio->p->memory.io[GBA_REG(SIOMULTI0)] = 0xFFFF;
 				sio->p->memory.io[GBA_REG(SIOMULTI1)] = 0xFFFF;
@@ -211,6 +224,27 @@ void GBASIOWriteSIOCNT(struct GBASIO* sio, uint16_t value) {
 			sio->rcnt = GBASIORegisterRCNTFillSc(sio->rcnt);
 		}
 		if (GBASIONormalIsStart(value) && !GBASIONormalIsStart(sio->siocnt)) {
+			// The register a driver reads here has to be the one the game just
+			// wrote, and until this line it is not: sio->siocnt is assigned at
+			// the END of this function, and a write that changes mode has
+			// already cut it down to `value & 0x3000` above, so every bit below
+			// bit 12 is stale or gone.
+			//
+			// No driver can work around that from outside. Normal mode's clock
+			// owner is SC, bit 0, and this branch exists precisely for a game
+			// claiming the clock -- so a driver asked "are you the master?"
+			// read the SC of the PREVIOUS write and answered for the role the
+			// game had just stopped having. A multiboot host does exactly this:
+			// it takes the clock and sets start in one write, and was judged on
+			// the listener it was a moment earlier, so it declined to originate
+			// and the upload never began. The give-away is that the value such a
+			// driver sees carries no start bit at all, on a path that only runs
+			// because the start bit was just set.
+			//
+			// Assigned after the edge test above, which still needs the old
+			// value, and assigned again at the end of the function once the
+			// driver has had its say on `value`.
+			sio->siocnt = value;
 			_startTransfer(sio);
 		}
 		break;

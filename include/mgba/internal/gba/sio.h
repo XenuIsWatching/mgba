@@ -44,6 +44,22 @@ DECL_BIT(GBASIONormal, IdleSo, 3);
 DECL_BIT(GBASIONormal, Start, 7);
 DECL_BIT(GBASIONormal, Length, 12);
 DECL_BIT(GBASIONormal, Irq, 14);
+/* These two describe the SAME 16-bit register, so the fields below overlap the
+ * ones above, and a value written under one reading is read back under the
+ * other:
+ *
+ *     Multiplayer Baud  (0-1)  covers  Normal Sc (0) and InternalSc (1)
+ *     Multiplayer Slave (2)      is    Normal Si (2)
+ *     Multiplayer Ready (3)      is    Normal IdleSo (3)
+ *
+ * Two consequences worth knowing before touching either set. A DRIVER's own
+ * writes come back to it as the register it is later judged on: a Ready or Slave
+ * bit it drove in multiplayer is an IdleSo or Si bit once the game switches to
+ * normal mode. And a game that changes mode and starts a transfer in one write
+ * leaves the PREVIOUS mode's reading of these bits standing until that write
+ * completes, which is why GBASIOWriteSIOCNT has to make sio->siocnt current
+ * before it dispatches driver->start().
+ */
 DECL_BITFIELD(GBASIOMultiplayer, uint16_t);
 DECL_BITS(GBASIOMultiplayer, Baud, 0, 2);
 DECL_BIT(GBASIOMultiplayer, Slave, 2);
