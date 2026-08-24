@@ -114,10 +114,19 @@ jobs:
           submodules: recursive
           ref: ${{ github.event.inputs.ref || github.ref }}
 
-      # Android takes the stock USE_* defaults, unlike Windows. It builds because
-      # none of those libraries is found for the target and CMake falls back;
-      # spelling them out here would only invite them to drift from what was
-      # actually tested, which was a bare configure.
+      # The optional libraries are turned OFF explicitly, and that is not a
+      # departure from the desktop build -- it is how you reproduce it here.
+      #
+      # That build ran on a Windows host, where none of these exists to be found
+      # and every one of them quietly resolved to off. A Linux runner HAS them,
+      # for x86_64, and mGBA's CMake finds them: the link line picks up
+      # -L/usr/lib/x86_64-linux-gnu -lm, lld infers an x86_64 target from the
+      # host libm it then loads, and rejects the NDK's own arm64-only
+      # --fix-cortex-a53-843419 with "only supported on AArch64 targets". The
+      # error names a CPU erratum flag and has nothing to do with one.
+      #
+      # A cross-build must never be left to discover libraries; the ones it finds
+      # are the wrong architecture by construction.
       - name: Configure
         run: >
           cmake -S . -B build-android-arm64 -G Ninja
@@ -125,6 +134,10 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release
           -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26
           -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake
+          -DUSE_ZLIB=OFF -DUSE_PNG=OFF -DUSE_LIBZIP=OFF -DUSE_MINIZIP=OFF
+          -DUSE_LZMA=OFF -DUSE_SQLITE3=OFF -DUSE_ELF=OFF -DUSE_FFMPEG=OFF
+          -DUSE_EPOXY=OFF -DUSE_DISCORD_RPC=OFF -DUSE_EDITLINE=OFF
+          -DUSE_FREETYPE=OFF -DUSE_LUA=OFF -DUSE_JSON_C=OFF
 
       # The libretro target is a file(GLOB) evaluated at configure time, so a new
       # source file added since the last configure links as an undefined symbol.
