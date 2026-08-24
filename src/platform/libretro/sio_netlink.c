@@ -437,9 +437,33 @@ static void _updateReady(struct GBASIONetlink* nl) {
 	 */
 	ready = true;
 
-	mLOG(GBA_SIO, DEBUG, "netlink: ready=%i (mode %i, peers %u)", (int) ready, (int) nl->mode, nl->peers);
+	mLOG(GBA_SIO, DEBUG, "netlink: ready=%i (mode %i, peers %u, id %i)",
+	     (int) ready, (int) nl->mode, nl->peers, nl->selfId);
 	sio->siocnt = GBASIOMultiplayerSetReady(sio->siocnt, ready);
 	sio->rcnt = GBASIORegisterRCNTSetSd(sio->rcnt, ready);
+
+	/* And WHO this machine is on the cable, for exactly the same reason.
+	 *
+	 * SIOCNT's id and slave bits are hardware-driven just like the ready bit
+	 * above: the cable decides them and the game only reads them. mGBA does
+	 * derive them, in GBASIOWriteSIOCNT, from `id || !connected` -- but only on a
+	 * WRITE, and a game sitting on a menu waiting for a partner does not write
+	 * SIOCNT. So a machine that booted with nothing in its socket computed
+	 * connected = 0, marked itself a SLAVE, and kept that answer after a cable
+	 * arrived. A slave never originates a transfer, so with both machines holding
+	 * a stale slave bit neither ever clocked the other: the party sat trading
+	 * nothing while every peer count in the room correctly read two.
+	 *
+	 * That is what made a lead seated mid-session look like a dead cable, and it
+	 * is what the room was papering over by power-cycling any machine that first
+	 * saw a cable. A Game Boy Advance does not need that -- the cable is sampled
+	 * continuously on hardware -- and it threw away whatever the player was doing.
+	 *
+	 * Same expression mGBA's own in-process lockstep driver maintains on every
+	 * membership change, and the same one GBASIOWriteSIOCNT would reach on its
+	 * next write. This only stops the answer going stale in between. */
+	sio->siocnt = GBASIOMultiplayerSetId(sio->siocnt, nl->selfId);
+	sio->siocnt = GBASIOMultiplayerSetSlave(sio->siocnt, nl->selfId || nl->peers < 2);
 }
 
 /* Answer one JOY bus command from the GameCube.
