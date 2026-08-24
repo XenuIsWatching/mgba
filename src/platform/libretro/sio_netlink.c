@@ -308,6 +308,13 @@ static void _storeWord(struct GBASIONetlink* nl, unsigned index, uint32_t word) 
 
 static void _refreshPeers(struct GBASIONetlink* nl) {
 	unsigned was = nl->peers;
+	/* And who this machine WAS, which moves without the count moving.
+	 *
+	 * Seats change on their own. Two cabled pairs merging into one wider bus
+	 * renumbers machines that were already playing, so a machine can go from
+	 * player one to player three while the number of machines it can see never
+	 * changes at all. Watching only the count misses every one of those. */
+	int was_id = nl->selfId;
 	unsigned count = 0;
 	int id = nl->link->peers(nl->handle, &count);
 	if (id < 0) {
@@ -331,7 +338,21 @@ static void _refreshPeers(struct GBASIONetlink* nl) {
 		nl->selfId = 0;
 	}
 
-	if (nl->peers != was) {
+	/* Either one. A renumber changes no count and everything else:
+	 *
+	 * - SIOCNT's id and slave bits are maintained in _updateReady, which only
+	 *   runs from here and from setMode. Miss the renumber and the machine that
+	 *   just BECAME the parent still reads back "slave", so its game never takes
+	 *   the clock, while the one that became a child correctly refuses to. Then
+	 *   nobody originates and the wire goes silent with both counts still
+	 *   reading two, which is exactly what a seat swap did to a running game:
+	 *   5110 messages before it, 5110 three watch steps later.
+	 * - peerModes and peerLines are indexed BY BUS SLOT, and this function's
+	 *   caller is free to hand a slot to somebody else. After a renumber they
+	 *   describe the wrong machines until each of them happens to speak again.
+	 *   _peersChanged forgets them and asks everyone to say it all again, which
+	 *   is precisely the repair a renumber needs. */
+	if (nl->peers != was || nl->selfId != was_id) {
 		_peersChanged(nl);
 	}
 }
