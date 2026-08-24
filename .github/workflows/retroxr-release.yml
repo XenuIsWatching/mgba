@@ -1,0 +1,186 @@
+# Build the retroXR mGBA core for Windows and Android and publish it as a
+# release, so retroXR's CoreDownloadManager can fetch it.
+#
+# This fork exists for one thing: mGBA has carried its own lockstep link
+# coordinator for years and nothing in libretro could reach it. Two cores in one
+# process are two copies of the library sharing no globals, so the only thing two
+# handhelds have in common is the frontend -- and this build talks to a link bus
+# the frontend hosts. That is what makes two Game Boys in one room play together,
+# single-cartridge play work, and a GameCube lead reach a handheld at all.
+#
+# mGBA is MPL-2.0, so unlike Dolphin there is no source obligation attached to
+# the binary. The source sits on the tag beside it anyway, for the practical
+# reason that it is the only way anyone can tell what they are running.
+#
+# The contract with the app is entirely in the asset names. RetroXR reads
+# CoreSources.SOURCES["mgba"].assets and asks for exactly one filename per
+# platform; a miss is reported as a miss rather than falling back to the
+# buildbot, so a renamed asset here is a core that simply never downloads.
+#
+#   Windows  mgba_libretro.dll.zip          containing mgba_libretro.dll
+#   Android  mgba_libretro_android.so.zip   containing mgba_libretro_android.so
+#
+# Note the _android infix, which azahar's asset does NOT have. The two sit next
+# to each other in core_sources.gd and the wrong name fails silently.
+#
+# The release must NOT be a prerelease: the download URL is the /releases/latest/
+# form so shipping a build needs no app update, and GitHub's `latest` skips
+# prereleases. Anything else cut on this fork should be marked prerelease.
+name: retroXR core release
+
+on:
+  push:
+    tags:
+      - 'retroxr-mgba-libretro-v*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag or SHA to build'
+        required: true
+        default: 'retroxr'
+      tag:
+        description: 'Release tag to publish as (leave blank to build without publishing)'
+        required: false
+        default: ''
+
+jobs:
+  windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      # Every flag here is load-bearing and was found the hard way on a desktop:
+      # without the policy version the vendored zlib and libpng refuse to
+      # configure, without ENABLE_DIRECTORIES the Windows VFS source does not
+      # compile, and with zlib found but not linked the core fails at crc32.
+      - name: Configure (MSVC)
+        run: >
+          cmake -S . -B build-win -G "Visual Studio 18 2026" -A x64
+          -DBUILD_LIBRETRO=ON -DBUILD_QT=OFF -DBUILD_SDL=OFF
+          -DSKIP_LIBRARY=ON -DUSE_DISCORD_RPC=OFF
+          "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+          "-DCMAKE_C_FLAGS=/DENABLE_DIRECTORIES"
+          -DUSE_ZLIB=OFF -DUSE_PNG=OFF -DUSE_LIBZIP=OFF -DUSE_MINIZIP=OFF
+          -DUSE_LZMA=OFF -DUSE_SQLITE3=OFF -DUSE_ELF=OFF -DUSE_FFMPEG=OFF
+          -DUSE_EPOXY=OFF
+
+      - name: Build
+        run: cmake --build build-win --config Release --target mgba_libretro --parallel
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $hits = @(Get-ChildItem -Path build-win -Recurse -Filter "mgba_libretro.dll" -File)
+          if ($hits.Count -ne 1) {
+            Write-Host "expected exactly one mgba_libretro.dll, found $($hits.Count):"
+            $hits | ForEach-Object { Write-Host "  $($_.FullName)" }
+            exit 1
+          }
+          New-Item -ItemType Directory -Path stage | Out-Null
+          Copy-Item $hits[0].FullName stage/mgba_libretro.dll
+          Compress-Archive -Path stage/mgba_libretro.dll -DestinationPath mgba_libretro.dll.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: mgba_libretro.dll.zip
+          if-no-files-found: error
+
+  android:
+    name: Android arm64-v8a
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build wget unzip zip
+          wget -q https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          unzip -q android-ndk-r27d-linux.zip
+          echo "ANDROID_NDK_HOME=$PWD/android-ndk-r27d" >> $GITHUB_ENV
+
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      # Android takes the stock USE_* defaults, unlike Windows. It builds because
+      # none of those libraries is found for the target and CMake falls back;
+      # spelling them out here would only invite them to drift from what was
+      # actually tested, which was a bare configure.
+      - name: Configure
+        run: >
+          cmake -S . -B build-android-arm64 -G Ninja
+          -DBUILD_LIBRETRO=ON -DBUILD_QT=OFF -DBUILD_SDL=OFF
+          -DCMAKE_BUILD_TYPE=Release
+          -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26
+          -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake
+
+      # The libretro target is a file(GLOB) evaluated at configure time, so a new
+      # source file added since the last configure links as an undefined symbol.
+      # A fresh tree per run makes that a non-issue here; it bites on a desktop.
+      - name: Build
+        run: cmake --build build-android-arm64 --target mgba_libretro -j $(nproc)
+
+      - name: Package
+        run: |
+          mapfile -t hits < <(find build-android-arm64 -name 'mgba_libretro*.so' -type f)
+          if [ "${#hits[@]}" -ne 1 ]; then
+            echo "expected exactly one mgba_libretro*.so, found ${#hits[@]}:"
+            printf '  %s\n' "${hits[@]}"
+            exit 1
+          fi
+          mkdir -p stage
+          cp "${hits[0]}" stage/mgba_libretro_android.so
+          (cd stage && zip -q -X ../mgba_libretro_android.so.zip mgba_libretro_android.so)
+          ls -lh mgba_libretro_android.so.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: mgba_libretro_android.so.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: [windows, android]
+    if: github.event_name == 'push' || github.event.inputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          ls -lh dist
+          cat > notes.md <<EOF
+          mGBA libretro core built for retroXR, from \`$GITHUB_SHA\`.
+
+          Windows x86_64 and Android arm64-v8a. The source for these binaries is
+          this tag.
+
+          Over the stock buildbot build this reaches mGBA's link coordinator
+          through a bus the frontend hosts, for both the Game Boy Advance and the
+          Game Boy -- they are separate cores with separate serial ports, and the
+          Game Boy side carried nothing at all before it.
+          EOF
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "mGBA (retroXR build) $TAG" \
+              --notes-file notes.md
+          fi
+          gh release upload "$TAG" \
+            dist/mgba_libretro.dll.zip \
+            dist/mgba_libretro_android.so.zip \
+            --repo "$GITHUB_REPOSITORY" --clobber
