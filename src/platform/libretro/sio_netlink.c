@@ -22,17 +22,29 @@
 #define JOY_BITS_PER_SECOND 115200
 #define JOY_CYCLES_PER_BIT (GBA_ARM7TDMI_FREQUENCY / JOY_BITS_PER_SECOND)
 
-/* Rendezvous roughly every 15 microseconds of emulated time.
+/* Floor for the rendezvous grain, and what is used before a party is known.
  *
- * The ceiling is the shortest transfer carried: 5755 cycles for two units at
- * 115200 baud. The horizon is also how far the two machines may drift apart, and
- * a transfer's two halves have to meet inside it, so a quarter of the shortest
- * transfer leaves room for the reply to arrive before the master finishes.
- * At 1024 a good share of transfers completed with only one half present.
+ * The floor is cost: every grain is a rendezvous between threads, so this cannot
+ * go lower without the cores spending their time synchronising rather than
+ * emulating. Measured on a four-handheld Quest session, the host coordinator's
+ * wake path was 23.67% of all CPU cycles against 6.49% for the four emulators
+ * put together, and a bench over that bus puts the cost dead linear in the
+ * rendezvous RATE: at four machines, 27.5 ms of bus time at grain 256 against
+ * 4.0 ms at 2048, with every other measured number unchanged.
  *
- * The floor is cost: every grain is a rendezvous between two threads, so this
- * cannot go much lower without both cores spending their time synchronising
- * rather than emulating. */
+ * This is no longer the multiplayer ceiling as well; see _grainForMulti.
+ *
+ * The comment replaced here stated a quarter of the shortest transfer as the
+ * rule and then used 256, which is a TWENTY-SECOND of a two-unit transfer, on
+ * the strength of "at 1024 a good share of transfers completed with only one
+ * half present". That measurement does not survive its own history. It was
+ * written 2026-08-20 09:23, in the same commit as the first "get both halves of
+ * a transfer" fix, and two more landed after it: the monotonic clock at 09:33,
+ * and at 09:38 the one that matters -- a child latched its word when the start
+ * MESSAGE arrived rather than when the master's clock reached the transfer,
+ * which that commit describes as "a whole commit horizon earlier". That bug grew
+ * WITH the horizon, so a larger grain made it worse, which is exactly what was
+ * seen and blamed on the grain. Nobody re-measured after the fix. */
 #define NETLINK_GRAIN 256
 
 /* And how often to look when there is nothing to look FOR.
@@ -55,25 +67,60 @@
 #define NETLINK_IDLE_GRAIN 4096
 
 
+/* Multiplayer's grain, which depends on how many machines are on the wire.
+ *
+ * A multiplayer transfer gets LONGER as the party grows -- 5755 cycles for two
+ * units, 10486 for four -- so the constraint loosens with every handheld that
+ * joins, while a constant tightens it for nobody's benefit. The party is the
+ * only input: the BAUD is deliberately not consulted, and the fastest one is
+ * assumed instead. A game may change baud at any time, and a horizon sized to a
+ * slow baud would be invalidated by that write; sizing to the fastest means the
+ * real transfer is only ever longer than the one planned for.
+ *
+ * A quarter of the shortest, which is what the comment above _grainForMode
+ * always claimed the rule was. The mechanism only needs the horizon to fit
+ * inside the transfer: the master announces at commit = now + horizon, and the
+ * barrier lets a peer reach that horizon "and not one tick further", so a child
+ * lands exactly ON the commit tick, latches its word and sends. The master can
+ * only reach the transfer's finish once the child has published far enough for
+ * it to, which is commit + cycles - horizon >= commit whenever horizon <= cycles.
+ * A quarter leaves three quarters of that in hand.
+ *
+ * Never below NETLINK_GRAIN, so a pair can never end up finer than it is today.
+ */
+static uint64_t _grainForMulti(unsigned peers) {
+	int32_t cycles;
+	uint64_t grain;
+
+	if (peers < 2 || peers > MAX_GBAS) {
+		return NETLINK_GRAIN;
+	}
+
+	/* Baud 3 is 115200, the fastest and so the shortest transfer. */
+	cycles = GBASIOTransferCycles(GBA_SIO_MULTI, 0x0003, (int) peers - 1);
+	if (cycles <= 0) {
+		return NETLINK_GRAIN;
+	}
+
+	grain = (uint64_t) cycles / 4;
+	return grain < NETLINK_GRAIN ? NETLINK_GRAIN : grain;
+}
+
 /* Rendezvous grain for a mode, in cycles.
  *
- * A transfer is announced a horizon ahead and must complete with every peer's
- * half present, so the horizon has to stay well inside the SHORTEST transfer the
- * mode can carry: multiplayer's is 5755 cycles, normal 32-bit's is 256, and
- * normal 8-bit's is 64. One constant cannot serve both -- 256 is a comfortable
- * twentieth of a multiplayer transfer and an entire normal one.
- *
- * A quarter of the shortest, which leaves room for a peer that is itself a
- * horizon behind. Normal mode therefore rendezvouses four times as often as
- * multiplayer, and that is a real cost paid only while a game is actually in
- * normal mode: single-cartridge play is a burst of about a second, not a
- * session, and the two machines are back on the coarse grain afterwards. */
-static uint64_t _grainForMode(enum GBASIOMode mode) {
+ * Normal mode's transfers are far shorter than multiplayer's -- 256 cycles for
+ * 32-bit, 64 for 8-bit -- so it rendezvouses much more often, and that is a real
+ * cost paid only while a game is actually in normal mode: single-cartridge play
+ * is a burst of about a second, not a session, and the machines are back on the
+ * coarse grain afterwards. */
+static uint64_t _grainForMode(enum GBASIOMode mode, unsigned peers) {
 	switch (mode) {
 	case GBA_SIO_NORMAL_8:
 		return 16;
 	case GBA_SIO_NORMAL_32:
 		return 64;
+	case GBA_SIO_MULTI:
+		return _grainForMulti(peers);
 	default:
 		return NETLINK_GRAIN;
 	}
@@ -186,6 +233,20 @@ static void _peersChanged(struct GBASIONetlink* nl) {
 		_send(nl, _commitTick(nl), NL_MODE, (uint32_t) nl->mode, 0);
 		_send(nl, _commitTick(nl), NL_LINES, nl->lines, 0);
 	}
+
+	/* A multiplayer transfer's length depends on how many machines are on the
+	 * wire, so the horizon it has to fit inside just moved. Only while nothing is
+	 * in flight: a transfer announced under the old horizon has to complete under
+	 * it, or the peers would be looking for it at a tick this machine no longer
+	 * means. Whatever is in flight finishes first and the next one is planned at
+	 * the new grain -- the event is left alone rather than re-booked, because it
+	 * is at most one old grain away and re-booking it mid-transfer is the very
+	 * thing being avoided. */
+	if (!nl->transferActive && !nl->pendingStart) {
+		nl->grain = _grainForMode(nl->mode, nl->peers);
+		nl->horizon = nl->grain;
+	}
+
 	_updateReady(nl);
 }
 
@@ -633,7 +694,7 @@ static void GBASIONetlinkSetMode(struct GBASIODriver* driver, enum GBASIOMode mo
 	nl->transferActive = false;
 	nl->pendingStart = false;
 	nl->received = 0;
-	nl->grain = _grainForMode(mode);
+	nl->grain = _grainForMode(mode, nl->peers);
 	nl->horizon = nl->grain;
 	if (nl->d.p && nl->d.p->p) {
 		mTimingDeschedule(&nl->d.p->p->timing, &nl->event);
