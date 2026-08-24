@@ -98,9 +98,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build wget unzip zip
-          wget -q https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
-          unzip -q android-ndk-r27d-linux.zip
-          echo "ANDROID_NDK_HOME=$PWD/android-ndk-r27d" >> $GITHUB_ENV
+          # Into RUNNER_TEMP, NOT the workspace. This step runs before
+          # actions/checkout, and checkout clears the workspace it checks into --
+          # so an NDK unpacked at $PWD here exists at the end of this step and is
+          # gone by the time cmake looks for its toolchain file. The failure names
+          # a missing toolchain rather than a missing NDK, which sends you looking
+          # at the wrong thing entirely.
+          wget -q -O "$RUNNER_TEMP/ndk.zip" \
+            https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          unzip -q "$RUNNER_TEMP/ndk.zip" -d "$RUNNER_TEMP"
+          echo "ANDROID_NDK_HOME=$RUNNER_TEMP/android-ndk-r27d" >> $GITHUB_ENV
 
       - uses: actions/checkout@v6
         with:
