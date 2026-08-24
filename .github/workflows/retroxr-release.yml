@@ -155,6 +155,37 @@ jobs:
           fi
           mkdir -p stage
           cp "${hits[0]}" stage/mgba_libretro_android.so
+
+          # Strip, because CMake does not and nothing downstream will. This core
+          # is downloaded onto a headset at runtime and kept in internal storage,
+          # and better than half of it is debug_info. (ndk-build strips on
+          # install, which is why the Makefile-based cores never needed this and
+          # this one does.)
+          #
+          # --strip-unneeded and not --strip-all: the frontend finds this core by
+          # dlsym, so removing the dynamic symbol table would leave a core that
+          # downloads, installs, and cannot be loaded at all.
+          STRIP="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          NM="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          before=$(stat -c%s stage/mgba_libretro_android.so)
+          "$STRIP" --strip-unneeded stage/mgba_libretro_android.so
+          after=$(stat -c%s stage/mgba_libretro_android.so)
+          echo "stripped: $before -> $after bytes"
+
+          # And prove the entry points survived it, rather than assuming. A core
+          # missing these is indistinguishable from a failed download to anyone
+          # looking at the app.
+          exports=$("$NM" --dynamic --defined-only stage/mgba_libretro_android.so \
+            | grep -c ' retro_' || true)
+          echo "retro_* exports after stripping: $exports"
+          for sym in retro_api_version retro_init retro_load_game retro_run; do
+            if ! "$NM" --dynamic --defined-only stage/mgba_libretro_android.so \
+                 | grep -q " $sym\$"; then
+              echo "FATAL: $sym is not exported after stripping"
+              exit 1
+            fi
+          done
+
           (cd stage && zip -q -X ../mgba_libretro_android.so.zip mgba_libretro_android.so)
           ls -lh mgba_libretro_android.so.zip
 
