@@ -88,16 +88,43 @@
  *
  * Never below NETLINK_GRAIN, so a pair can never end up finer than it is today.
  */
-static uint64_t _grainForMulti(unsigned peers) {
+static uint64_t _grainForMulti(struct GBASIONetlink* nl) {
 	int32_t cycles;
 	uint64_t grain;
+	unsigned i;
 
-	if (peers < 2 || peers > MAX_GBAS) {
+	if (nl->peers < 2 || nl->peers > MAX_GBAS) {
 		return NETLINK_GRAIN;
 	}
 
+	/* Only while the whole party is actually IN multiplayer.
+	 *
+	 * A coarse grain is a blind window: this machine looks at the wire once per
+	 * grain and sees nothing in between. That is fine when everyone is settled in
+	 * multiplayer and the only thing happening is transfers, and it is wrong
+	 * during single-cartridge boot, where the machines flip between MULTI and
+	 * NORMAL_32 repeatedly while the host hands the client a program. At a
+	 * quarter of a multiplayer transfer the driver missed those turns and the
+	 * upload never started: measured, the probe fell from 164258 messages and a
+	 * busiest second of 11206 to 902 and 156, which is a handshake and nothing
+	 * else.
+	 *
+	 * So the scaled grain is claimed only when every peer has announced the same
+	 * mode this machine is in. Any disagreement -- which is exactly what a
+	 * multiboot looks like -- drops back to the fine grain until the party
+	 * settles. Unseen counts as disagreement: a peer that has not spoken yet is
+	 * not known to be anywhere. */
+	for (i = 0; i < nl->peers && i < MAX_GBAS; ++i) {
+		if ((int) i == nl->selfId) {
+			continue;
+		}
+		if (!(nl->peerModesSeen & (1u << i)) || nl->peerModes[i] != nl->mode) {
+			return NETLINK_GRAIN;
+		}
+	}
+
 	/* Baud 3 is 115200, the fastest and so the shortest transfer. */
-	cycles = GBASIOTransferCycles(GBA_SIO_MULTI, 0x0003, (int) peers - 1);
+	cycles = GBASIOTransferCycles(GBA_SIO_MULTI, 0x0003, (int) nl->peers - 1);
 	if (cycles <= 0) {
 		return NETLINK_GRAIN;
 	}
@@ -113,14 +140,14 @@ static uint64_t _grainForMulti(unsigned peers) {
  * cost paid only while a game is actually in normal mode: single-cartridge play
  * is a burst of about a second, not a session, and the machines are back on the
  * coarse grain afterwards. */
-static uint64_t _grainForMode(enum GBASIOMode mode, unsigned peers) {
+static uint64_t _grainForMode(struct GBASIONetlink* nl, enum GBASIOMode mode) {
 	switch (mode) {
 	case GBA_SIO_NORMAL_8:
 		return 16;
 	case GBA_SIO_NORMAL_32:
 		return 64;
 	case GBA_SIO_MULTI:
-		return _grainForMulti(peers);
+		return _grainForMulti(nl);
 	default:
 		return NETLINK_GRAIN;
 	}
@@ -243,7 +270,7 @@ static void _peersChanged(struct GBASIONetlink* nl) {
 	 * is at most one old grain away and re-booking it mid-transfer is the very
 	 * thing being avoided. */
 	if (!nl->transferActive && !nl->pendingStart) {
-		nl->grain = _grainForMode(nl->mode, nl->peers);
+		nl->grain = _grainForMode(nl, nl->mode);
 		nl->horizon = nl->grain;
 	}
 
@@ -351,6 +378,18 @@ static void _handleMessage(struct GBASIONetlink* nl, const uint8_t* msg, uint64_
 			nl->peerModes[from] = (enum GBASIOMode) _read32(&msg[4]);
 			nl->peerModesSeen |= 1u << from;
 			_updateReady(nl);
+
+			/* The party's agreement is what licenses the coarse grain, and this
+			 * is where that agreement changes. Without recomputing here, a
+			 * machine keeps whatever grain it claimed when the modes last
+			 * matched -- the blind window single-cartridge boot cannot survive.
+			 * Only while nothing is in flight, for the same reason
+			 * _peersChanged is careful: a transfer announced under one horizon
+			 * has to complete under it. */
+			if (!nl->transferActive && !nl->pendingStart) {
+				nl->grain = _grainForMode(nl, nl->mode);
+				nl->horizon = nl->grain;
+			}
 		}
 		break;
 	case NL_XFER_START:
@@ -718,7 +757,7 @@ static void GBASIONetlinkSetMode(struct GBASIODriver* driver, enum GBASIOMode mo
 	nl->transferActive = false;
 	nl->pendingStart = false;
 	nl->received = 0;
-	nl->grain = _grainForMode(mode, nl->peers);
+	nl->grain = _grainForMode(nl, mode);
 	nl->horizon = nl->grain;
 	if (nl->d.p && nl->d.p->p) {
 		mTimingDeschedule(&nl->d.p->p->timing, &nl->event);
