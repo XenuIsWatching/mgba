@@ -37,6 +37,7 @@ CXX_GUARD_START
 struct GBASIONetlink {
 	struct GBASIODriver d;
 	struct mTimingEvent event;
+	struct mTimingEvent joyEvent;
 
 	const struct retro_link_interface* link;
 	unsigned port;

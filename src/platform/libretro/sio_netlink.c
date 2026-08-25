@@ -21,6 +21,10 @@
  * have always assumed, and the reply has to land where the asker expects it. */
 #define JOY_BITS_PER_SECOND 115200
 #define JOY_CYCLES_PER_BIT (GBA_ARM7TDMI_FREQUENCY / JOY_BITS_PER_SECOND)
+/* The shortest supported JOY exchange is a 32-bit reset or poll. Rendezvous at
+ * a quarter of that wire time, independently of whatever the GBA link port is
+ * doing. */
+#define JOY_SYNC_GRAIN ((32 * JOY_CYCLES_PER_BIT) / 4)
 
 /* Floor for the rendezvous grain, and what is used before a party is known.
  *
@@ -224,6 +228,7 @@ static void GBASIONetlinkFinishMultiplayer(struct GBASIODriver* driver, uint16_t
 static uint8_t GBASIONetlinkFinishNormal8(struct GBASIODriver* driver);
 static uint32_t GBASIONetlinkFinishNormal32(struct GBASIODriver* driver);
 static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cyclesLate);
+static void _joyEvent(struct mTiming* timing, void* context, uint32_t cyclesLate);
 static void _updateReady(struct GBASIONetlink* nl);
 static void _send(struct GBASIONetlink* nl, uint64_t tick, uint8_t type, uint32_t a, uint32_t b);
 static void _sendTo(struct GBASIONetlink* nl, uint64_t tick, unsigned to, uint8_t type, uint32_t a, uint32_t b);
@@ -780,6 +785,10 @@ void GBASIONetlinkCreate(struct GBASIONetlink* nl, const struct retro_link_inter
 	nl->event.name = "GBA SIO Netlink";
 	nl->event.callback = _netlinkEvent;
 	nl->event.priority = 0x80;
+	nl->joyEvent.context = nl;
+	nl->joyEvent.name = "GBA JOY Netlink";
+	nl->joyEvent.callback = _joyEvent;
+	nl->joyEvent.priority = 0x80;
 
 	nl->link = link;
 	nl->port = port;
@@ -820,6 +829,7 @@ static bool GBASIONetlinkInit(struct GBASIODriver* driver) {
 	nl->joyHandle = nl->link->attach(nl->joyPort, JOYLINK_PROTOCOL, GBA_ARM7TDMI_FREQUENCY);
 	if (nl->joyHandle) {
 		nl->joyAttached = true;
+		mTimingSchedule(&driver->p->p->timing, &nl->joyEvent, JOY_SYNC_GRAIN);
 	}
 
 	mTimingSchedule(&driver->p->p->timing, &nl->event, (int32_t) nl->syncGrain);
@@ -829,6 +839,7 @@ static bool GBASIONetlinkInit(struct GBASIODriver* driver) {
 static void GBASIONetlinkDeinit(struct GBASIODriver* driver) {
 	struct GBASIONetlink* nl = (struct GBASIONetlink*) driver;
 	mTimingDeschedule(&driver->p->p->timing, &nl->event);
+	mTimingDeschedule(&driver->p->p->timing, &nl->joyEvent);
 	GBASIONetlinkDestroy(nl);
 }
 
@@ -855,6 +866,10 @@ static void GBASIONetlinkReset(struct GBASIODriver* driver) {
 	 * GBASIODolphinReset does the same thing for the same reason. */
 	mTimingDeschedule(&driver->p->p->timing, &nl->event);
 	mTimingSchedule(&driver->p->p->timing, &nl->event, (int32_t) nl->syncGrain);
+	if (nl->joyAttached) {
+		mTimingDeschedule(&driver->p->p->timing, &nl->joyEvent);
+		mTimingSchedule(&driver->p->p->timing, &nl->joyEvent, JOY_SYNC_GRAIN);
+	}
 }
 
 static void GBASIONetlinkSetMode(struct GBASIODriver* driver, enum GBASIOMode mode) {
@@ -1196,27 +1211,6 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 	}
 	_pump(nl, cyclesLate);
 
-	/* The GameCube lead, if one is in. Its own advance, because the bus bounds
-	 * each port separately and a console on one must not be held up by a
-	 * handheld on the other.
-	 *
-	 * This is where the socket version's clock channel went. Dolphin sends a
-	 * time slice down a second socket precisely because TCP has no shared clock;
-	 * the bus does, and converts between a GameCube's tick rate and a Game Boy
-	 * Advance's on the way past, so there is nothing left to send. */
-	if (nl->joyAttached) {
-		unsigned joyCount = 0;
-		if (nl->link->peers(nl->joyHandle, &joyCount) >= 0) {
-			nl->joyPeers = joyCount;
-		} else {
-			nl->joyPeers = 0;
-		}
-		if (nl->joyPeers >= 2) {
-			nl->link->advance(nl->joyHandle, now, now + nl->syncGrain, now + nl->syncGrain);
-			_pumpJoy(nl);
-		}
-	}
-
 	/* Latch this machine's half once its clock reaches the transfer's start. */
 	if (nl->pendingStart && now >= nl->pendingTick) {
 		nl->pendingStart = false;
@@ -1253,7 +1247,7 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 
 	/* Coarsen while there is nothing on either wire and nothing in flight. The
 	 * checks are cheap and local; the thing being avoided is not. */
-	if (!nl->transferActive && !nl->pendingStart && nl->peers < 2 && nl->joyPeers < 2) {
+	if (!nl->transferActive && !nl->pendingStart && nl->peers < 2) {
 		step = NETLINK_IDLE_GRAIN;
 	}
 
@@ -1266,4 +1260,35 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 		step = 1;
 	}
 	mTimingSchedule(timing, &nl->event, step);
+}
+
+/* GameCube JOY is a separate physical protocol on a separate bus. Its shortest
+ * command, lookahead promise, and polling cadence must not change when a GBA
+ * link-cable peer changes mode or joins a multiplayer party. */
+static void _joyEvent(struct mTiming* timing, void* context, uint32_t cyclesLate) {
+	struct GBASIONetlink* nl = context;
+	uint64_t now = _now(nl);
+	uint64_t grant = RETRO_LINK_UNBOUNDED;
+	int32_t step = NETLINK_IDLE_GRAIN;
+	unsigned joyCount = 0;
+
+	if (nl->link->peers(nl->joyHandle, &joyCount) >= 0) {
+		nl->joyPeers = joyCount;
+	} else {
+		nl->joyPeers = 0;
+	}
+	if (nl->joyPeers >= 2) {
+		grant = nl->link->advance(nl->joyHandle, now,
+		                              now + JOY_SYNC_GRAIN, now + JOY_SYNC_GRAIN);
+		_pumpJoy(nl);
+		step = JOY_SYNC_GRAIN;
+	}
+	if (grant != RETRO_LINK_UNBOUNDED && grant > now && grant - now < (uint64_t) step) {
+		step = (int32_t) (grant - now);
+	}
+	step -= (int32_t) cyclesLate;
+	if (step < 1) {
+		step = 1;
+	}
+	mTimingSchedule(timing, &nl->joyEvent, step);
 }
