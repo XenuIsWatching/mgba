@@ -50,6 +50,7 @@
  * WITH the horizon, so a larger grain made it worse, which is exactly what was
  * seen and blamed on the grain. Nobody re-measured after the fix. */
 #define NETLINK_GRAIN 256
+#define NETLINK_NEGOTIATING_GRAIN 512
 
 /* And how often to look when there is nothing to look FOR.
  *
@@ -136,7 +137,7 @@ static uint64_t _grainForMulti(struct GBASIONetlink* nl) {
 			continue;
 		}
 		if (!(nl->peerModesSeen & (1u << i)) || nl->peerModes[i] != nl->mode) {
-			return NETLINK_GRAIN;
+			return NETLINK_NEGOTIATING_GRAIN;
 		}
 	}
 
@@ -148,7 +149,7 @@ static uint64_t _grainForMulti(struct GBASIONetlink* nl) {
 		bool peersReady = (nl->peerCartridgesSeen & expected) == expected &&
 		                  ((nl->peerCartridges | nl->peerMultibootReady) & expected) == expected;
 		if (!localReady || !peersReady) {
-			return NETLINK_GRAIN;
+			return NETLINK_NEGOTIATING_GRAIN;
 		}
 	}
 
@@ -166,16 +167,17 @@ static uint64_t _grainForMulti(struct GBASIONetlink* nl) {
  *
  * Normal mode's shortest transfers are far shorter than multiplayer's: 64
  * cycles for 8-bit and 256 for 32-bit with the fast internal clock. The slow
- * clock takes 512 and 2048 cycles respectively. The grains below deliberately
- * use a quarter of the shortest case, so either clock remains safe. This is a
+ * clock takes 512 and 2048 cycles respectively. The grains below use the whole
+ * shortest case, so either clock remains safe while avoiding intermediate
+ * rendezvous inside a transfer. This is a
  * real cost paid while a game is in normal mode; single-cartridge play returns
  * to the coarse multiplayer grain after its upload completes. */
 static uint64_t _grainForMode(struct GBASIONetlink* nl, enum GBASIOMode mode) {
 	switch (mode) {
 	case GBA_SIO_NORMAL_8:
-		return 16;
-	case GBA_SIO_NORMAL_32:
 		return 64;
+	case GBA_SIO_NORMAL_32:
+		return 256;
 	case GBA_SIO_MULTI:
 		return _grainForMulti(nl);
 	default:
