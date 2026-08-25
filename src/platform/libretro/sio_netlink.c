@@ -1184,7 +1184,7 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 	uint64_t now = _now(nl);
 	uint64_t grant;
 	uint32_t word;
-	int32_t step = (int32_t) nl->grain;
+	int32_t step;
 
 	/* Publish before reading. A peer parked on this core's horizon cannot move
 	 * until it has been told the horizon moved, and it may be sitting on the
@@ -1247,6 +1247,12 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 			nl->nextStateAnnounce = now + STATE_ANNOUNCE_RETRY;
 		}
 	}
+
+	/* Select the next step only after pumping and refreshing membership: either
+	 * path may have changed the mode, readiness phase, or party size and thus the
+	 * grain. Keeping the value captured at entry would leave one stale coarse
+	 * blind window on a coarse-to-fine transition. */
+	step = (int32_t) nl->grain;
 
 	/* Coarsen while there is nothing on either wire and nothing in flight. The
 	 * checks are cheap and local; the thing being avoided is not. */
