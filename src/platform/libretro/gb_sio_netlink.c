@@ -456,6 +456,7 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 	struct GBSIONetlink* nl = context;
 	struct GB* gb = _gb(nl);
 	uint64_t now = _now(nl);
+	uint32_t wakeFlags = RETRO_LINK_WAKE_NONE;
 	int32_t step;
 
 	nl->grain = nl->fastSeen ? GBNL_GRAIN_FAST : GBNL_GRAIN_NORMAL;
@@ -469,11 +470,8 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 	/* Publish before reading. A peer parked on this core's horizon cannot move
 	 * until it has been told the horizon moved, and it may be sitting on the very
 	 * message this core is about to want. */
-	{
-		uint32_t wakeFlags = RETRO_LINK_WAKE_NONE;
-		nl->grant = nl->link->advance(nl->handle, now, now + nl->horizon,
-		                             now + nl->grain, &wakeFlags);
-	}
+	nl->grant = nl->link->advance(nl->handle, now, now + nl->horizon,
+	                             now + nl->grain, &wakeFlags);
 	nl->anchored = true;
 	_pump(nl);
 	_applyDue(nl);
@@ -494,6 +492,9 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 	}
 
 	step = (int32_t) nl->grain;
+	if (wakeFlags != RETRO_LINK_WAKE_NONE && nl->grant <= now) {
+		step = 1;
+	}
 	if (nl->grant != RETRO_LINK_UNBOUNDED && nl->grant > now && nl->grant - now < (uint64_t) step) {
 		step = (int32_t) (nl->grant - now);
 	}

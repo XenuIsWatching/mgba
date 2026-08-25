@@ -1272,6 +1272,9 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 	 * blind window on a coarse-to-fine transition. */
 	nl->syncGrain = _schedulingGrain(nl, nl->mode, now);
 	step = (int32_t) nl->syncGrain;
+	if (wakeFlags != RETRO_LINK_WAKE_NONE && grant <= now) {
+		step = 1;
+	}
 
 	/* Coarsen while there is nothing on either wire and nothing in flight. The
 	 * checks are cheap and local; the thing being avoided is not. */
@@ -1312,6 +1315,9 @@ static void _joyEvent(struct mTiming* timing, void* context, uint32_t cyclesLate
 		                              &wakeFlags);
 		_pumpJoy(nl);
 		step = JOY_SYNC_GRAIN;
+	}
+	if (wakeFlags != RETRO_LINK_WAKE_NONE && grant <= now) {
+		step = 1;
 	}
 	if (grant != RETRO_LINK_UNBOUNDED && grant > now && grant - now < (uint64_t) step) {
 		step = (int32_t) (grant - now);
