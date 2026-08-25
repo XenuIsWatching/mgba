@@ -87,8 +87,10 @@ struct GBASIONetlink {
 	bool haveRaw;
 	uint64_t nowBase;
 
-	uint64_t horizon;
-	uint64_t grain;
+	/* This implementation intentionally uses one value for both the lookahead
+	 * promise and event cadence. Keeping two always-equal fields only allowed
+	 * transitions to update one without the other. */
+	uint64_t syncGrain;
 
 	enum GBASIOMode mode;
 

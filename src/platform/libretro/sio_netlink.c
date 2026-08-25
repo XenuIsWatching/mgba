@@ -309,8 +309,7 @@ static void _peersChanged(struct GBASIONetlink* nl) {
 	 * is at most one old grain away and re-booking it mid-transfer is the very
 	 * thing being avoided. */
 	if (!nl->transferActive && !nl->pendingStart) {
-		nl->grain = _grainForMode(nl, nl->mode);
-		nl->horizon = nl->grain;
+		nl->syncGrain = _grainForMode(nl, nl->mode);
 	}
 
 	_updateReady(nl);
@@ -445,7 +444,7 @@ static void _sendTo(struct GBASIONetlink* nl, uint64_t tick, unsigned to, uint8_
  * originated event to the horizon, rather than firing it the instant the guest
  * asked, is what makes the promise published to the bus true. */
 static uint64_t _commitTick(struct GBASIONetlink* nl) {
-	return _now(nl) + nl->horizon;
+	return _now(nl) + nl->syncGrain;
 }
 
 static void _scheduleFinish(struct GBASIONetlink* nl, uint64_t finishTick, uint32_t cyclesLate) {
@@ -495,8 +494,7 @@ static void _handleMessage(struct GBASIONetlink* nl, const uint8_t* msg, uint64_
 			 * _peersChanged is careful: a transfer announced under one horizon
 			 * has to complete under it. */
 			if (!nl->transferActive && !nl->pendingStart) {
-				nl->grain = _grainForMode(nl, nl->mode);
-				nl->horizon = nl->grain;
+				nl->syncGrain = _grainForMode(nl, nl->mode);
 			}
 		}
 		break;
@@ -787,8 +785,7 @@ void GBASIONetlinkCreate(struct GBASIONetlink* nl, const struct retro_link_inter
 	nl->port = port;
 	/* The GameCube lead's port sits beside the link cable's. */
 	nl->joyPort = port + 1;
-	nl->horizon = NETLINK_GRAIN;
-	nl->grain = NETLINK_GRAIN;
+	nl->syncGrain = NETLINK_GRAIN;
 	nl->mode = (enum GBASIOMode) -1;
 	memset(nl->multiData, 0xFF, sizeof(nl->multiData));
 }
@@ -825,7 +822,7 @@ static bool GBASIONetlinkInit(struct GBASIODriver* driver) {
 		nl->joyAttached = true;
 	}
 
-	mTimingSchedule(&driver->p->p->timing, &nl->event, (int32_t) nl->grain);
+	mTimingSchedule(&driver->p->p->timing, &nl->event, (int32_t) nl->syncGrain);
 	return true;
 }
 
@@ -857,7 +854,7 @@ static void GBASIONetlinkReset(struct GBASIODriver* driver) {
 	 * crosses, because nothing is left to call advance or drain the inbox.
 	 * GBASIODolphinReset does the same thing for the same reason. */
 	mTimingDeschedule(&driver->p->p->timing, &nl->event);
-	mTimingSchedule(&driver->p->p->timing, &nl->event, (int32_t) nl->grain);
+	mTimingSchedule(&driver->p->p->timing, &nl->event, (int32_t) nl->syncGrain);
 }
 
 static void GBASIONetlinkSetMode(struct GBASIODriver* driver, enum GBASIOMode mode) {
@@ -876,11 +873,10 @@ static void GBASIONetlinkSetMode(struct GBASIODriver* driver, enum GBASIOMode mo
 	nl->transferActive = false;
 	nl->pendingStart = false;
 	nl->received = 0;
-	nl->grain = _grainForMode(nl, mode);
-	nl->horizon = nl->grain;
+	nl->syncGrain = _grainForMode(nl, mode);
 	if (nl->d.p && nl->d.p->p) {
 		mTimingDeschedule(&nl->d.p->p->timing, &nl->event);
-		mTimingSchedule(&nl->d.p->p->timing, &nl->event, (int32_t) nl->grain);
+		mTimingSchedule(&nl->d.p->p->timing, &nl->event, (int32_t) nl->syncGrain);
 	}
 
 	mLOG(GBA_SIO, DEBUG, "netlink: mode -> %i (peers %u, id %i)", (int) mode, nl->peers, nl->selfId);
@@ -1194,7 +1190,7 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 	 * unbounded every time, and the only thing it costs is the lock it takes to
 	 * say so -- millions of times over a session. */
 	if (nl->peers >= 2 || nl->transferActive || nl->pendingStart) {
-		grant = nl->link->advance(nl->handle, now, now + nl->horizon, now + nl->grain);
+		grant = nl->link->advance(nl->handle, now, now + nl->syncGrain, now + nl->syncGrain);
 	} else {
 		grant = RETRO_LINK_UNBOUNDED;
 	}
@@ -1216,7 +1212,7 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 			nl->joyPeers = 0;
 		}
 		if (nl->joyPeers >= 2) {
-			nl->link->advance(nl->joyHandle, now, now + nl->horizon, now + nl->grain);
+			nl->link->advance(nl->joyHandle, now, now + nl->syncGrain, now + nl->syncGrain);
 			_pumpJoy(nl);
 		}
 	}
@@ -1253,7 +1249,7 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 	 * path may have changed the mode, readiness phase, or party size and thus the
 	 * grain. Keeping the value captured at entry would leave one stale coarse
 	 * blind window on a coarse-to-fine transition. */
-	step = (int32_t) nl->grain;
+	step = (int32_t) nl->syncGrain;
 
 	/* Coarsen while there is nothing on either wire and nothing in flight. The
 	 * checks are cheap and local; the thing being avoided is not. */
