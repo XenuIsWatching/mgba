@@ -818,14 +818,20 @@ static int GBASIONetlinkConnectedDevices(struct GBASIODriver* driver) {
 		 * on the link cable. */
 		return nl->joyPeers >= 2 ? 1 : 0;
 	}
-	_refreshPeers(nl);
+	/* Membership is cached by the netlink timing event. GBASIOWriteSIOCNT calls
+	 * connectedDevices and deviceId on every guest write, and multiplayer games
+	 * write SIOCNT continuously. Refreshing here made each write take the
+	 * frontend's global link mutex twice, in addition to the regular rendezvous.
+	 *
+	 * The event polls membership once per grain and is explicitly woken by a
+	 * topology change, so the cached values are both timely and the same values
+	 * these two callbacks would obtain back-to-back. */
 	/* mGBA counts the other machines on the cable, not including this one. */
 	return nl->peers > 0 ? (int) (nl->peers - 1) : 0;
 }
 
 static int GBASIONetlinkDeviceId(struct GBASIODriver* driver) {
 	struct GBASIONetlink* nl = (struct GBASIONetlink*) driver;
-	_refreshPeers(nl);
 	return nl->selfId;
 }
 
