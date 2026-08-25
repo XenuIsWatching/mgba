@@ -193,7 +193,16 @@ static bool _carried(enum GBASIOMode mode) {
 /* Bus message. Packed by hand rather than shipped as a struct: both ends are
  * the same build today, but protocol_id exists so that a GameCube core could
  * speak this later, and by then a shared struct layout would be an assumption
- * nobody remembers having made. */
+ * nobody remembers having made.
+ *
+ * APPEND ONLY. Dolphin hardcodes the NUMERIC value of NL_JOY_CMD and
+ * NL_JOY_REPLY in its GBALink.cpp, in another repository, because it cannot
+ * include this file. Inserting a kind renumbers everything after it and
+ * silently breaks the GameCube lead: mGBA reads the console's now-stale
+ * command byte as some other kind, drops it as not-a-JOY-command, and never
+ * replies. Not hypothetical -- adding NL_STATE_ACK here (0192b7b7f,
+ * 2026-08-24) did exactly that. It went unnoticed because both ends still
+ * reported two peers, and the only thing checking was checking peers. */
 enum {
 	NL_MODE = 1,
 	NL_XFER_START,
@@ -201,7 +210,8 @@ enum {
 	NL_LINES,
 	NL_STATE_ACK,
 
-	/* The GameCube lead's two. It asks, this answers; nothing else crosses. */
+	/* The GameCube lead's two. It asks, this answers; nothing else crosses.
+	 * Dolphin's GBALink.cpp must agree on these numbers: 6 and 7. */
 	NL_JOY_CMD,
 	NL_JOY_REPLY
 };
