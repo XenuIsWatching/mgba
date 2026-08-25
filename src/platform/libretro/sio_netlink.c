@@ -69,6 +69,8 @@
  * about 68 compared with the former 4096-cycle interval. _refreshPeers returns
  * to the active grain as soon as a peer appears. */
 #define NETLINK_IDLE_GRAIN (GBA_ARM7TDMI_FREQUENCY / 60)
+#define NETLINK_CONNECTED_IDLE_GRAIN 4096
+#define NETLINK_ACTIVE_HOLD GBA_ARM7TDMI_FREQUENCY
 /* Once per video frame until acknowledged. Fast enough to repair an attachment
  * race before a person can reach the menu, without flooding a partially
  * populated four-seat bus whose live indices are temporarily sparse. */
@@ -235,6 +237,7 @@ static void _sendTo(struct GBASIONetlink* nl, uint64_t tick, unsigned to, uint8_
 static uint32_t _stateToken(struct GBASIONetlink* nl);
 static void _updateMultibootReady(struct GBASIONetlink* nl);
 static uint64_t _commitTick(struct GBASIONetlink* nl);
+static uint64_t _schedulingGrain(struct GBASIONetlink* nl, enum GBASIOMode mode, uint64_t now);
 
 static uint64_t _now(struct GBASIONetlink* nl) {
 	int32_t raw = mTimingCurrentTime(&nl->d.p->p->timing);
@@ -289,6 +292,7 @@ static void _peersChanged(struct GBASIONetlink* nl) {
 	nl->peerCartridgesSeen = 0;
 	nl->peerMultibootReady = 0;
 	nl->multibootReady = false;
+	nl->publishedSafeUntil = _now(nl);
 	nl->stateGeneration = (nl->stateGeneration + 1) & ~STATE_TOKEN_FLAGS;
 	if (nl->stateGeneration == 0) {
 		++nl->stateGeneration;
@@ -314,7 +318,7 @@ static void _peersChanged(struct GBASIONetlink* nl) {
 	 * is at most one old grain away and re-booking it mid-transfer is the very
 	 * thing being avoided. */
 	if (!nl->transferActive && !nl->pendingStart) {
-		nl->syncGrain = _grainForMode(nl, nl->mode);
+		nl->syncGrain = _schedulingGrain(nl, nl->mode, _now(nl));
 	}
 
 	_updateReady(nl);
@@ -404,6 +408,17 @@ static void _send(struct GBASIONetlink* nl, uint64_t tick, uint8_t type, uint32_
 	_sendTo(nl, tick, RETRO_LINK_BROADCAST, type, a, b);
 }
 
+static bool _transferPhaseActive(struct GBASIONetlink* nl, uint64_t now) {
+	return nl->transferActive || nl->pendingStart || now < nl->activeUntil;
+}
+
+static uint64_t _schedulingGrain(struct GBASIONetlink* nl, enum GBASIOMode mode, uint64_t now) {
+	if (nl->peers >= 2 && !_transferPhaseActive(nl, now)) {
+		return NETLINK_CONNECTED_IDLE_GRAIN;
+	}
+	return _grainForMode(nl, mode);
+}
+
 static uint32_t _stateToken(struct GBASIONetlink* nl) {
 	uint32_t token = nl->stateGeneration & ~STATE_TOKEN_FLAGS;
 	if (nl->d.p && nl->d.p->p && nl->d.p->p->memory.romSize > 0) {
@@ -449,7 +464,8 @@ static void _sendTo(struct GBASIONetlink* nl, uint64_t tick, unsigned to, uint8_
  * originated event to the horizon, rather than firing it the instant the guest
  * asked, is what makes the promise published to the bus true. */
 static uint64_t _commitTick(struct GBASIONetlink* nl) {
-	return _now(nl) + nl->syncGrain;
+	uint64_t commit = _now(nl) + nl->syncGrain;
+	return commit < nl->publishedSafeUntil ? nl->publishedSafeUntil : commit;
 }
 
 static void _scheduleFinish(struct GBASIONetlink* nl, uint64_t finishTick, uint32_t cyclesLate) {
@@ -504,6 +520,7 @@ static void _handleMessage(struct GBASIONetlink* nl, const uint8_t* msg, uint64_
 		}
 		break;
 	case NL_XFER_START:
+		nl->activeUntil = _now(nl) + NETLINK_ACTIVE_HOLD;
 		if (nl->mode == GBA_SIO_MULTI && nl->selfId == 0) {
 			/* In multiplayer only the clock owner starts transfers, so this is
 			 * not ours. Normal mode has no such rule: the clock belongs to
@@ -543,6 +560,7 @@ static void _handleMessage(struct GBASIONetlink* nl, const uint8_t* msg, uint64_
 		}
 		break;
 	case NL_XFER_DATA:
+		nl->activeUntil = _now(nl) + NETLINK_ACTIVE_HOLD;
 		_storeWord(nl, from, _read32(&msg[4]));
 		break;
 	default:
@@ -795,6 +813,8 @@ void GBASIONetlinkCreate(struct GBASIONetlink* nl, const struct retro_link_inter
 	/* The GameCube lead's port sits beside the link cable's. */
 	nl->joyPort = port + 1;
 	nl->syncGrain = NETLINK_GRAIN;
+	nl->publishedSafeUntil = 0;
+	nl->activeUntil = 0;
 	nl->mode = (enum GBASIOMode) -1;
 	memset(nl->multiData, 0xFF, sizeof(nl->multiData));
 }
@@ -888,7 +908,7 @@ static void GBASIONetlinkSetMode(struct GBASIODriver* driver, enum GBASIOMode mo
 	nl->transferActive = false;
 	nl->pendingStart = false;
 	nl->received = 0;
-	nl->syncGrain = _grainForMode(nl, mode);
+	nl->syncGrain = _schedulingGrain(nl, mode, _now(nl));
 	if (nl->d.p && nl->d.p->p) {
 		mTimingDeschedule(&nl->d.p->p->timing, &nl->event);
 		mTimingSchedule(&nl->d.p->p->timing, &nl->event, (int32_t) nl->syncGrain);
@@ -1067,6 +1087,8 @@ static bool GBASIONetlinkStart(struct GBASIODriver* driver) {
 		mLOG(GBA_SIO, GAME_ERROR, "Transfer restarted unexpectedly");
 		return false;
 	}
+	nl->activeUntil = _now(nl) + NETLINK_ACTIVE_HOLD;
+	nl->syncGrain = _grainForMode(nl, nl->mode);
 
 	commit = _commitTick(nl);
 	cycles = GBASIOTransferCycles(nl->mode, nl->d.p->siocnt, (int) nl->peers - 1);
@@ -1206,6 +1228,7 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 	 * unbounded every time, and the only thing it costs is the lock it takes to
 	 * say so -- millions of times over a session. */
 	if (nl->peers >= 2 || nl->transferActive || nl->pendingStart) {
+		nl->publishedSafeUntil = now + nl->syncGrain;
 		grant = nl->link->advance(nl->handle, now, now + nl->syncGrain,
 		                          now + nl->syncGrain, &wakeFlags);
 	} else {
@@ -1245,6 +1268,7 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 	 * path may have changed the mode, readiness phase, or party size and thus the
 	 * grain. Keeping the value captured at entry would leave one stale coarse
 	 * blind window on a coarse-to-fine transition. */
+	nl->syncGrain = _schedulingGrain(nl, nl->mode, now);
 	step = (int32_t) nl->syncGrain;
 
 	/* Coarsen while there is nothing on either wire and nothing in flight. The

@@ -92,6 +92,8 @@ struct GBASIONetlink {
 	 * promise and event cadence. Keeping two always-equal fields only allowed
 	 * transitions to update one without the other. */
 	uint64_t syncGrain;
+	uint64_t publishedSafeUntil;
+	uint64_t activeUntil;
 
 	enum GBASIOMode mode;
 
