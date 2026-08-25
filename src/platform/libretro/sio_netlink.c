@@ -91,14 +91,15 @@
  * slow baud would be invalidated by that write; sizing to the fastest means the
  * real transfer is only ever longer than the one planned for.
  *
- * A quarter of the shortest, which is what the comment above _grainForMode
- * always claimed the rule was. The mechanism only needs the horizon to fit
+ * Half of the shortest. The mechanism only needs the horizon to fit
  * inside the transfer: the master announces at commit = now + horizon, and the
  * barrier lets a peer reach that horizon "and not one tick further", so a child
  * lands exactly ON the commit tick, latches its word and sends. The master can
  * only reach the transfer's finish once the child has published far enough for
  * it to, which is commit + cycles - horizon >= commit whenever horizon <= cycles.
- * A quarter leaves three quarters of that in hand.
+ * Half leaves the other half in hand while cutting steady-state rendezvous in
+ * half. This matters on four-core mobile systems, where condition-variable
+ * traffic rather than GBA emulation is the limiting cost.
  *
  * Never below NETLINK_GRAIN, so a pair can never end up finer than it is today.
  */
@@ -159,7 +160,7 @@ static uint64_t _grainForMulti(struct GBASIONetlink* nl) {
 		return NETLINK_GRAIN;
 	}
 
-	grain = (uint64_t) cycles / 4;
+	grain = (uint64_t) cycles / 2;
 	return grain < NETLINK_GRAIN ? NETLINK_GRAIN : grain;
 }
 
