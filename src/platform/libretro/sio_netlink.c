@@ -69,6 +69,9 @@
  * race before a person can reach the menu, without flooding a partially
  * populated four-seat bus whose live indices are temporarily sparse. */
 #define STATE_ANNOUNCE_RETRY (GBA_ARM7TDMI_FREQUENCY / 60)
+#define STATE_TOKEN_CARTRIDGE 0x80000000u
+#define STATE_TOKEN_MULTIBOOT_READY 0x40000000u
+#define STATE_TOKEN_FLAGS (STATE_TOKEN_CARTRIDGE | STATE_TOKEN_MULTIBOOT_READY)
 
 
 /* Multiplayer's grain, which depends on how many machines are on the wire.
@@ -114,15 +117,31 @@ static uint64_t _grainForMulti(struct GBASIONetlink* nl) {
 	 * else.
 	 *
 	 * So the scaled grain is claimed only when every peer has announced the same
-	 * mode this machine is in. Any disagreement -- which is exactly what a
-	 * multiboot looks like -- drops back to the fine grain until the party
-	 * settles. Unseen counts as disagreement: a peer that has not spoken yet is
-	 * not known to be anywhere. */
+	 * mode this machine is in. Unseen counts as disagreement: a peer that has not
+	 * spoken yet is not known to be anywhere.
+	 *
+	 * Mode agreement alone is insufficient for a three- or four-machine
+	 * single-pak upload: long stretches of the BIOS protocol keep every machine
+	 * in MULTI. Cartridge-less peers therefore also announce when their PC has
+	 * left the BIOS for downloaded EWRAM. Keep the fine grain until every blank
+	 * peer reaches that point; four-cartridge games qualify immediately. */
 	for (i = 0; i < nl->peers && i < MAX_GBAS; ++i) {
 		if ((int) i == nl->selfId) {
 			continue;
 		}
 		if (!(nl->peerModesSeen & (1u << i)) || nl->peerModes[i] != nl->mode) {
+			return NETLINK_GRAIN;
+		}
+	}
+
+	{
+		uint32_t expected = (1u << nl->peers) - 1u;
+		expected &= ~(1u << nl->selfId);
+		bool localCart = nl->d.p && nl->d.p->p && nl->d.p->p->memory.romSize > 0;
+		bool localReady = localCart || nl->multibootReady;
+		bool peersReady = (nl->peerCartridgesSeen & expected) == expected &&
+		                  ((nl->peerCartridges | nl->peerMultibootReady) & expected) == expected;
+		if (!localReady || !peersReady) {
 			return NETLINK_GRAIN;
 		}
 	}
@@ -207,6 +226,8 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 static void _updateReady(struct GBASIONetlink* nl);
 static void _send(struct GBASIONetlink* nl, uint64_t tick, uint8_t type, uint32_t a, uint32_t b);
 static void _sendTo(struct GBASIONetlink* nl, uint64_t tick, unsigned to, uint8_t type, uint32_t a, uint32_t b);
+static uint32_t _stateToken(struct GBASIONetlink* nl);
+static void _updateMultibootReady(struct GBASIONetlink* nl);
 static uint64_t _commitTick(struct GBASIONetlink* nl);
 
 static uint64_t _now(struct GBASIONetlink* nl) {
@@ -258,7 +279,12 @@ static void _peersChanged(struct GBASIONetlink* nl) {
 	nl->peerLinesSeen = 0;
 	nl->peerModeAcks = 0;
 	nl->peerLineAcks = 0;
-	if (++nl->stateGeneration == 0) {
+	nl->peerCartridges = 0;
+	nl->peerCartridgesSeen = 0;
+	nl->peerMultibootReady = 0;
+	nl->multibootReady = false;
+	nl->stateGeneration = (nl->stateGeneration + 1) & ~STATE_TOKEN_FLAGS;
+	if (nl->stateGeneration == 0) {
 		++nl->stateGeneration;
 	}
 	nl->nextStateAnnounce = 0;
@@ -269,8 +295,8 @@ static void _peersChanged(struct GBASIONetlink* nl) {
 		 * both ends would sit waiting to be told the other was ready. The peers
 		 * this machine just forgot are owed the same, and cannot be relied on to
 		 * volunteer it: they are subject to the RCNT silence above too. */
-		_send(nl, _commitTick(nl), NL_MODE, (uint32_t) nl->mode, nl->stateGeneration);
-		_send(nl, _commitTick(nl), NL_LINES, nl->lines, nl->stateGeneration);
+		_send(nl, _commitTick(nl), NL_MODE, (uint32_t) nl->mode, _stateToken(nl));
+		_send(nl, _commitTick(nl), NL_LINES, nl->lines, _stateToken(nl));
 	}
 
 	/* A multiplayer transfer's length depends on how many machines are on the
@@ -373,6 +399,37 @@ static void _send(struct GBASIONetlink* nl, uint64_t tick, uint8_t type, uint32_
 	_sendTo(nl, tick, RETRO_LINK_BROADCAST, type, a, b);
 }
 
+static uint32_t _stateToken(struct GBASIONetlink* nl) {
+	uint32_t token = nl->stateGeneration & ~STATE_TOKEN_FLAGS;
+	if (nl->d.p && nl->d.p->p && nl->d.p->p->memory.romSize > 0) {
+		token |= STATE_TOKEN_CARTRIDGE;
+	}
+	if (nl->multibootReady) {
+		token |= STATE_TOKEN_MULTIBOOT_READY;
+	}
+	return token;
+}
+
+static void _updateMultibootReady(struct GBASIONetlink* nl) {
+	if (nl->multibootReady || !nl->attached || !nl->d.p || !nl->d.p->p ||
+	    nl->d.p->p->memory.romSize > 0 || !nl->d.p->p->cpu) {
+		return;
+	}
+	uint32_t pc = nl->d.p->p->cpu->gprs[ARM_PC];
+	if (pc < GBA_BASE_EWRAM || pc >= GBA_BASE_ROM0) {
+		return;
+	}
+	nl->multibootReady = true;
+	nl->stateGeneration = (nl->stateGeneration + 1) & ~STATE_TOKEN_FLAGS;
+	if (nl->stateGeneration == 0) {
+		nl->stateGeneration = 1;
+	}
+	nl->peerModeAcks = 0;
+	nl->peerLineAcks = 0;
+	_send(nl, _commitTick(nl), NL_MODE, (uint32_t) nl->mode, _stateToken(nl));
+	_send(nl, _commitTick(nl), NL_LINES, nl->lines, _stateToken(nl));
+}
+
 static void _sendTo(struct GBASIONetlink* nl, uint64_t tick, unsigned to, uint8_t type, uint32_t a, uint32_t b) {
 	uint8_t msg[NL_MSG_SIZE];
 	memset(msg, 0, sizeof(msg));
@@ -412,9 +469,21 @@ static void _handleMessage(struct GBASIONetlink* nl, const uint8_t* msg, uint64_
 	switch (msg[0]) {
 	case NL_MODE:
 		if (from < MAX_GBAS) {
+			uint32_t token = _read32(&msg[8]);
 			nl->peerModes[from] = (enum GBASIOMode) _read32(&msg[4]);
 			nl->peerModesSeen |= 1u << from;
-			_sendTo(nl, _commitTick(nl), from, NL_STATE_ACK, 1, _read32(&msg[8]));
+			nl->peerCartridgesSeen |= 1u << from;
+			if (token & STATE_TOKEN_CARTRIDGE) {
+				nl->peerCartridges |= 1u << from;
+			} else {
+				nl->peerCartridges &= ~(1u << from);
+			}
+			if (token & STATE_TOKEN_MULTIBOOT_READY) {
+				nl->peerMultibootReady |= 1u << from;
+			} else {
+				nl->peerMultibootReady &= ~(1u << from);
+			}
+			_sendTo(nl, _commitTick(nl), from, NL_STATE_ACK, 1, token);
 			_updateReady(nl);
 
 			/* The party's agreement is what licenses the coarse grain, and this
@@ -460,7 +529,7 @@ static void _handleMessage(struct GBASIONetlink* nl, const uint8_t* msg, uint64_
 		}
 		break;
 	case NL_STATE_ACK:
-		if (from < MAX_GBAS && _read32(&msg[8]) == nl->stateGeneration) {
+		if (from < MAX_GBAS && _read32(&msg[8]) == _stateToken(nl)) {
 			if (_read32(&msg[4]) & 1) {
 				nl->peerModeAcks |= 1u << from;
 			}
@@ -816,7 +885,7 @@ static void GBASIONetlinkSetMode(struct GBASIODriver* driver, enum GBASIOMode mo
 	mLOG(GBA_SIO, DEBUG, "netlink: mode -> %i (peers %u, id %i)", (int) mode, nl->peers, nl->selfId);
 	if (nl->attached) {
 		_refreshPeers(nl);
-		_send(nl, _commitTick(nl), NL_MODE, (uint32_t) mode, nl->stateGeneration);
+		_send(nl, _commitTick(nl), NL_MODE, (uint32_t) mode, _stateToken(nl));
 		_updateReady(nl);
 	}
 }
@@ -900,7 +969,7 @@ static uint16_t GBASIONetlinkWriteRCNT(struct GBASIODriver* driver, uint16_t val
 	if (mine != nl->lines || !nl->linesPublished) {
 		nl->lines = mine;
 		nl->linesPublished = true;
-		_send(nl, _commitTick(nl), NL_LINES, mine, nl->stateGeneration);
+		_send(nl, _commitTick(nl), NL_LINES, mine, _stateToken(nl));
 	}
 
 	_refreshPeers(nl);
@@ -1111,6 +1180,7 @@ static uint32_t GBASIONetlinkFinishNormal32(struct GBASIODriver* driver) {
 
 static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cyclesLate) {
 	struct GBASIONetlink* nl = context;
+	_updateMultibootReady(nl);
 	uint64_t now = _now(nl);
 	uint64_t grant;
 	uint32_t word;
@@ -1172,8 +1242,8 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 		expected &= ~(1u << nl->selfId);
 		if (((nl->peerModeAcks & expected) != expected ||
 		     (nl->peerLineAcks & expected) != expected) && now >= nl->nextStateAnnounce) {
-			_send(nl, _commitTick(nl), NL_MODE, (uint32_t) nl->mode, nl->stateGeneration);
-			_send(nl, _commitTick(nl), NL_LINES, nl->lines, nl->stateGeneration);
+			_send(nl, _commitTick(nl), NL_MODE, (uint32_t) nl->mode, _stateToken(nl));
+			_send(nl, _commitTick(nl), NL_LINES, nl->lines, _stateToken(nl));
 			nl->nextStateAnnounce = now + STATE_ANNOUNCE_RETRY;
 		}
 	}

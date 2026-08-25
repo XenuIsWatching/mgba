@@ -118,6 +118,10 @@ struct GBASIONetlink {
 	uint32_t peerModeAcks;
 	uint32_t peerLineAcks;
 	uint64_t nextStateAnnounce;
+	uint32_t peerCartridges;
+	uint32_t peerCartridgesSeen;
+	uint32_t peerMultibootReady;
+	bool multibootReady;
 
 	/* A transfer the master has announced but whose start tick this machine has
 	 * not reached yet. Its word is latched when it gets there, not when the
