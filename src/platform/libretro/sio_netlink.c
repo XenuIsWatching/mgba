@@ -65,6 +65,10 @@
  * _refreshPeers drops straight back to the fine grain the moment anyone
  * appears. */
 #define NETLINK_IDLE_GRAIN 4096
+/* Once per video frame until acknowledged. Fast enough to repair an attachment
+ * race before a person can reach the menu, without flooding a partially
+ * populated four-seat bus whose live indices are temporarily sparse. */
+#define STATE_ANNOUNCE_RETRY (GBA_ARM7TDMI_FREQUENCY / 60)
 
 
 /* Multiplayer's grain, which depends on how many machines are on the wire.
@@ -167,6 +171,7 @@ enum {
 	NL_XFER_START,
 	NL_XFER_DATA,
 	NL_LINES,
+	NL_STATE_ACK,
 
 	/* The GameCube lead's two. It asks, this answers; nothing else crosses. */
 	NL_JOY_CMD,
@@ -201,6 +206,7 @@ static uint32_t GBASIONetlinkFinishNormal32(struct GBASIODriver* driver);
 static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cyclesLate);
 static void _updateReady(struct GBASIONetlink* nl);
 static void _send(struct GBASIONetlink* nl, uint64_t tick, uint8_t type, uint32_t a, uint32_t b);
+static void _sendTo(struct GBASIONetlink* nl, uint64_t tick, unsigned to, uint8_t type, uint32_t a, uint32_t b);
 static uint64_t _commitTick(struct GBASIONetlink* nl);
 
 static uint64_t _now(struct GBASIONetlink* nl) {
@@ -250,6 +256,12 @@ static void _peersChanged(struct GBASIONetlink* nl) {
 	nl->peerModesSeen = 0;
 	memset(nl->peerLines, 0, sizeof(nl->peerLines));
 	nl->peerLinesSeen = 0;
+	nl->peerModeAcks = 0;
+	nl->peerLineAcks = 0;
+	if (++nl->stateGeneration == 0) {
+		++nl->stateGeneration;
+	}
+	nl->nextStateAnnounce = 0;
 
 	if (nl->attached) {
 		/* Say everything again. Both are announced when they CHANGE, so a machine
@@ -257,8 +269,8 @@ static void _peersChanged(struct GBASIONetlink* nl) {
 		 * both ends would sit waiting to be told the other was ready. The peers
 		 * this machine just forgot are owed the same, and cannot be relied on to
 		 * volunteer it: they are subject to the RCNT silence above too. */
-		_send(nl, _commitTick(nl), NL_MODE, (uint32_t) nl->mode, 0);
-		_send(nl, _commitTick(nl), NL_LINES, nl->lines, 0);
+		_send(nl, _commitTick(nl), NL_MODE, (uint32_t) nl->mode, nl->stateGeneration);
+		_send(nl, _commitTick(nl), NL_LINES, nl->lines, nl->stateGeneration);
 	}
 
 	/* A multiplayer transfer's length depends on how many machines are on the
@@ -358,13 +370,17 @@ static void _refreshPeers(struct GBASIONetlink* nl) {
 }
 
 static void _send(struct GBASIONetlink* nl, uint64_t tick, uint8_t type, uint32_t a, uint32_t b) {
+	_sendTo(nl, tick, RETRO_LINK_BROADCAST, type, a, b);
+}
+
+static void _sendTo(struct GBASIONetlink* nl, uint64_t tick, unsigned to, uint8_t type, uint32_t a, uint32_t b) {
 	uint8_t msg[NL_MSG_SIZE];
 	memset(msg, 0, sizeof(msg));
 	msg[0] = type;
 	msg[1] = (uint8_t) nl->selfId;
 	_write32(&msg[4], a);
 	_write32(&msg[8], b);
-	nl->link->send(nl->handle, tick, RETRO_LINK_BROADCAST, msg, sizeof(msg));
+	nl->link->send(nl->handle, tick, to, msg, sizeof(msg));
 }
 
 /* The earliest tick this core may make something happen at. Deferring an
@@ -398,6 +414,7 @@ static void _handleMessage(struct GBASIONetlink* nl, const uint8_t* msg, uint64_
 		if (from < MAX_GBAS) {
 			nl->peerModes[from] = (enum GBASIOMode) _read32(&msg[4]);
 			nl->peerModesSeen |= 1u << from;
+			_sendTo(nl, _commitTick(nl), from, NL_STATE_ACK, 1, _read32(&msg[8]));
 			_updateReady(nl);
 
 			/* The party's agreement is what licenses the coarse grain, and this
@@ -439,6 +456,17 @@ static void _handleMessage(struct GBASIONetlink* nl, const uint8_t* msg, uint64_
 		if (from < MAX_GBAS) {
 			nl->peerLines[from] = (uint8_t) _read32(&msg[4]);
 			nl->peerLinesSeen |= 1u << from;
+			_sendTo(nl, _commitTick(nl), from, NL_STATE_ACK, 2, _read32(&msg[8]));
+		}
+		break;
+	case NL_STATE_ACK:
+		if (from < MAX_GBAS && _read32(&msg[8]) == nl->stateGeneration) {
+			if (_read32(&msg[4]) & 1) {
+				nl->peerModeAcks |= 1u << from;
+			}
+			if (_read32(&msg[4]) & 2) {
+				nl->peerLineAcks |= 1u << from;
+			}
 		}
 		break;
 	case NL_XFER_DATA:
@@ -788,7 +816,7 @@ static void GBASIONetlinkSetMode(struct GBASIODriver* driver, enum GBASIOMode mo
 	mLOG(GBA_SIO, DEBUG, "netlink: mode -> %i (peers %u, id %i)", (int) mode, nl->peers, nl->selfId);
 	if (nl->attached) {
 		_refreshPeers(nl);
-		_send(nl, _commitTick(nl), NL_MODE, (uint32_t) mode, 0);
+		_send(nl, _commitTick(nl), NL_MODE, (uint32_t) mode, nl->stateGeneration);
 		_updateReady(nl);
 	}
 }
@@ -872,10 +900,11 @@ static uint16_t GBASIONetlinkWriteRCNT(struct GBASIODriver* driver, uint16_t val
 	if (mine != nl->lines || !nl->linesPublished) {
 		nl->lines = mine;
 		nl->linesPublished = true;
-		_send(nl, _commitTick(nl), NL_LINES, mine, 0);
+		_send(nl, _commitTick(nl), NL_LINES, mine, nl->stateGeneration);
 	}
 
 	_refreshPeers(nl);
+
 	if (nl->peers < 2) {
 		/* Nothing on the other end, so nothing to wire: the guest reads back what
 		 * it wrote, which is what mGBA does in this mode with no driver at all.
@@ -1133,6 +1162,21 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 	 * because a cable seated while the game is not touching its serial port has
 	 * to be noticed too. _refreshPeers itself announces any change. */
 	_refreshPeers(nl);
+
+	/* A newly attached core is not immediately a valid message destination: it
+	 * first has to publish its clock. If a membership-change announcement lands
+	 * in that window the frontend drops it, so retry both pieces until every
+	 * current peer has explicitly acknowledged this topology generation. */
+	if (nl->attached && nl->peers >= 2 && nl->peers <= MAX_GBAS && nl->selfId < (int) nl->peers) {
+		uint32_t expected = (1u << nl->peers) - 1u;
+		expected &= ~(1u << nl->selfId);
+		if (((nl->peerModeAcks & expected) != expected ||
+		     (nl->peerLineAcks & expected) != expected) && now >= nl->nextStateAnnounce) {
+			_send(nl, _commitTick(nl), NL_MODE, (uint32_t) nl->mode, nl->stateGeneration);
+			_send(nl, _commitTick(nl), NL_LINES, nl->lines, nl->stateGeneration);
+			nl->nextStateAnnounce = now + STATE_ANNOUNCE_RETRY;
+		}
+	}
 
 	/* Coarsen while there is nothing on either wire and nothing in flight. The
 	 * checks are cheap and local; the thing being avoided is not. */

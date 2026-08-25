@@ -111,6 +111,14 @@ struct GBASIONetlink {
 	uint8_t peerLines[MAX_GBAS];
 	uint32_t peerLinesSeen;
 
+	/* A topology announcement is repeated until every current peer acknowledges
+	 * both halves. Cores attach asynchronously, so the first broadcast can reach
+	 * the frontend before a new peer has published a timeline and be dropped. */
+	uint32_t stateGeneration;
+	uint32_t peerModeAcks;
+	uint32_t peerLineAcks;
+	uint64_t nextStateAnnounce;
+
 	/* A transfer the master has announced but whose start tick this machine has
 	 * not reached yet. Its word is latched when it gets there, not when the
 	 * message arrives. */
