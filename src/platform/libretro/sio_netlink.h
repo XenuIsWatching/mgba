@@ -29,9 +29,10 @@ CXX_GUARD_START
  *
  * Normal mode is what single-cartridge play runs over: the host sends a client
  * with no cartridge at all a program to run out of its RAM, in 32-bit words.
- * Those words are short -- 256 cycles against multiplayer's 5755 -- so normal
- * mode cannot share multiplayer's commit horizon, and the horizon follows the
- * mode rather than being one constant. */
+ * At the fast internal clock those words take 256 cycles against multiplayer's
+ * 5755; the slow clock takes 2048. The shortest case sets the safe bound, so
+ * normal mode cannot share multiplayer's commit horizon and the horizon follows
+ * the mode rather than being one constant. */
 
 struct GBASIONetlink {
 	struct GBASIODriver d;

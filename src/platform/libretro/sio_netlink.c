@@ -60,10 +60,9 @@
  * handhelds that is 39 million round trips through the coordinator's lock,
  * competing with the ports that had real work to do. The audio crackled.
  *
- * A frame's worth of cycles, near enough. A cable seated while the link is idle
- * is noticed within one frame, which is far quicker than a hand can move, and
- * _refreshPeers drops straight back to the fine grain the moment anyone
- * appears. */
+ * 4096 cycles is about 0.244 ms at the GBA clock, not a video frame. A cable
+ * seated while the link is idle is therefore noticed at roughly 4.1 kHz, and
+ * _refreshPeers returns to the active grain when anyone appears. */
 #define NETLINK_IDLE_GRAIN 4096
 /* Once per video frame until acknowledged. Fast enough to repair an attachment
  * race before a person can reach the menu, without flooding a partially
@@ -158,11 +157,12 @@ static uint64_t _grainForMulti(struct GBASIONetlink* nl) {
 
 /* Rendezvous grain for a mode, in cycles.
  *
- * Normal mode's transfers are far shorter than multiplayer's -- 256 cycles for
- * 32-bit, 64 for 8-bit -- so it rendezvouses much more often, and that is a real
- * cost paid only while a game is actually in normal mode: single-cartridge play
- * is a burst of about a second, not a session, and the machines are back on the
- * coarse grain afterwards. */
+ * Normal mode's shortest transfers are far shorter than multiplayer's: 64
+ * cycles for 8-bit and 256 for 32-bit with the fast internal clock. The slow
+ * clock takes 512 and 2048 cycles respectively. The grains below deliberately
+ * use a quarter of the shortest case, so either clock remains safe. This is a
+ * real cost paid while a game is in normal mode; single-cartridge play returns
+ * to the coarse multiplayer grain after its upload completes. */
 static uint64_t _grainForMode(struct GBASIONetlink* nl, enum GBASIOMode mode) {
 	switch (mode) {
 	case GBA_SIO_NORMAL_8:
