@@ -60,10 +60,11 @@
  * handhelds that is 39 million round trips through the coordinator's lock,
  * competing with the ports that had real work to do. The audio crackled.
  *
- * 4096 cycles is about 0.244 ms at the GBA clock, not a video frame. A cable
- * seated while the link is idle is therefore noticed at roughly 4.1 kHz, and
- * _refreshPeers returns to the active grain when anyone appears. */
-#define NETLINK_IDLE_GRAIN 4096
+ * One nominal video frame is still much faster than a person can seat a cable,
+ * while reducing an uncabled port's membership polling by another factor of
+ * about 68 compared with the former 4096-cycle interval. _refreshPeers returns
+ * to the active grain as soon as a peer appears. */
+#define NETLINK_IDLE_GRAIN (GBA_ARM7TDMI_FREQUENCY / 60)
 /* Once per video frame until acknowledged. Fast enough to repair an attachment
  * race before a person can reach the menu, without flooding a partially
  * populated four-seat bus whose live indices are temporarily sparse. */
