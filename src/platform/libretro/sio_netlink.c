@@ -1196,6 +1196,7 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 	uint64_t now = _now(nl);
 	uint64_t grant;
 	uint32_t word;
+	uint32_t wakeFlags = RETRO_LINK_WAKE_NONE;
 	int32_t step;
 
 	/* Publish before reading. A peer parked on this core's horizon cannot move
@@ -1205,7 +1206,8 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 	 * unbounded every time, and the only thing it costs is the lock it takes to
 	 * say so -- millions of times over a session. */
 	if (nl->peers >= 2 || nl->transferActive || nl->pendingStart) {
-		grant = nl->link->advance(nl->handle, now, now + nl->syncGrain, now + nl->syncGrain);
+		grant = nl->link->advance(nl->handle, now, now + nl->syncGrain,
+		                          now + nl->syncGrain, &wakeFlags);
 	} else {
 		grant = RETRO_LINK_UNBOUNDED;
 	}
@@ -1269,6 +1271,7 @@ static void _joyEvent(struct mTiming* timing, void* context, uint32_t cyclesLate
 	struct GBASIONetlink* nl = context;
 	uint64_t now = _now(nl);
 	uint64_t grant = RETRO_LINK_UNBOUNDED;
+	uint32_t wakeFlags = RETRO_LINK_WAKE_NONE;
 	int32_t step = NETLINK_IDLE_GRAIN;
 	unsigned joyCount = 0;
 
@@ -1279,7 +1282,8 @@ static void _joyEvent(struct mTiming* timing, void* context, uint32_t cyclesLate
 	}
 	if (nl->joyPeers >= 2) {
 		grant = nl->link->advance(nl->joyHandle, now,
-		                              now + JOY_SYNC_GRAIN, now + JOY_SYNC_GRAIN);
+		                              now + JOY_SYNC_GRAIN, now + JOY_SYNC_GRAIN,
+		                              &wakeFlags);
 		_pumpJoy(nl);
 		step = JOY_SYNC_GRAIN;
 	}

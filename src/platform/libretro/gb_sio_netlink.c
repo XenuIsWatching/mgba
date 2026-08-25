@@ -101,7 +101,7 @@ static void _wire(struct GBSIONetlink* nl, uint64_t tick, uint8_t type, uint8_t 
 	 * where its clock never reaches it. */
 	if (!nl->anchored) {
 		uint64_t now = _now(nl);
-		nl->grant = nl->link->advance(nl->handle, now, now + nl->horizon, now);
+		nl->grant = nl->link->advance(nl->handle, now, now + nl->horizon, now, NULL);
 		nl->anchored = true;
 	}
 
@@ -469,7 +469,11 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 	/* Publish before reading. A peer parked on this core's horizon cannot move
 	 * until it has been told the horizon moved, and it may be sitting on the very
 	 * message this core is about to want. */
-	nl->grant = nl->link->advance(nl->handle, now, now + nl->horizon, now + nl->grain);
+	{
+		uint32_t wakeFlags = RETRO_LINK_WAKE_NONE;
+		nl->grant = nl->link->advance(nl->handle, now, now + nl->horizon,
+		                             now + nl->grain, &wakeFlags);
+	}
 	nl->anchored = true;
 	_pump(nl);
 	_applyDue(nl);
