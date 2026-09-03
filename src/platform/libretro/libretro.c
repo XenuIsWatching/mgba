@@ -28,6 +28,7 @@
 
 #include "sio_netlink.h"
 #include "gb_sio_netlink.h"
+#include "ereader_disk.h"
 #include "libretro_core_options.h"
 
 #define GB_SAMPLES 512
@@ -1133,6 +1134,17 @@ bool retro_load_game(const struct retro_game_info* game) {
 	core->reset(core);
 	_setupMaps(core);
 
+#ifdef M_CORE_GBA
+	/* The e-Reader's card slot, as removable media. Published only for a cart
+	 * the override table gave HW_EREADER, and only after reset, because that is
+	 * when the override is applied -- announcing disk control unconditionally
+	 * would give every Game Boy Advance game a disc menu it has no drive for. */
+	if (core->platform(core) == mPLATFORM_GBA &&
+	    (((struct GBA*) core->board)->memory.hw.devices & HW_EREADER)) {
+		EReaderDiskPublish(core, environCallback);
+	}
+#endif
+
 	return true;
 }
 
@@ -1153,6 +1165,7 @@ void retro_unload_game(void) {
 		gbNetlinkAttached = false;
 	}
 #endif
+	EReaderDiskReset();
 	mCoreConfigDeinit(&core->config);
 	core->deinit(core);
 	mappedMemoryFree(data, dataSize);
