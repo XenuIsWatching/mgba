@@ -105,6 +105,10 @@ struct EReaderScan {
 };
 
 void GBACartEReaderInit(struct GBACartEReader* ereader);
+/// Put a calibrated, formatted image under a reader whose flash is blank.
+/// Idempotent, and called again once the savedata buffer is final — see the
+/// call in GBASavedataInitFlash.
+void GBACartEReaderSeedCalibration(struct GBACartEReader* ereader);
 void GBACartEReaderDeinit(struct GBACartEReader* ereader);
 void GBACartEReaderWrite(struct GBACartEReader* ereader, uint32_t address, uint16_t value);
 void GBACartEReaderWriteFlash(struct GBACartEReader* ereader, uint32_t address, uint8_t value);

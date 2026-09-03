@@ -24,6 +24,7 @@
 
 static void _eReaderReset(struct GBACartEReader* ereader);
 static void _eReaderWriteControl0(struct GBACartEReader* ereader, uint8_t value);
+void GBACartEReaderSeedCalibration(struct GBACartEReader* ereader);
 static void _eReaderWriteControl1(struct GBACartEReader* ereader, uint8_t value);
 static void _eReaderReadData(struct GBACartEReader* ereader);
 static void _eReaderReedSolomon(const uint8_t* input, uint8_t* output);
@@ -61,6 +62,22 @@ const uint8_t EREADER_CALIBRATION_TEMPLATE[] = {
 	0x3a, 0x39, 0x37, 0x35, 0x33, 0x2f, 0x2f, 0x34, 0x36, 0x36, 0x37, 0x36, 0x34, 0x31, 0x2d, 0x30,
 	0x32, 0x34, 0x35, 0x35, 0x34, 0x30, 0x2a, 0x2d, 0x2d, 0x2f, 0x31, 0x32, 0x31, 0x2f, 0x29, 0x2a,
 	0x2c, 0x2b, 0x2c, 0x2e, 0x2e, 0x2d, 0x18, 0x2d, 0x8f, 0x03, 0x00, 0x00, 0xc0, 0xfd, 0x77, 0x00,
+	0x00, 0x00, 0x01
+};
+
+// The calibration above is an original Card e-Reader's, and the e-Reader+
+// hardware rejects it: given it, the + and the US e-Reader (which is that same
+// hardware) power the scanner up, poke it nine times and power it down again
+// without ever asking for a card, so every scan ends in "Unable to read
+// e-Reader card". Seeded with a + unit's own calibration instead, both read
+// cards normally. Same 83-byte layout and the same "Card-E Reader 2001" header;
+// only the 53 bytes of scanner calibration from offset 20 differ.
+const uint8_t EREADER_CALIBRATION_TEMPLATE_PLUS[] = {
+	0x43, 0x61, 0x72, 0x64, 0x2d, 0x45, 0x20, 0x52, 0x65, 0x61, 0x64, 0x65, 0x72, 0x20, 0x32, 0x30,
+	0x30, 0x31, 0x00, 0x00, 0x67, 0xb7, 0x2b, 0x2e, 0x32, 0x33, 0x33, 0x33, 0x2f, 0x28, 0x2d, 0x2e,
+	0x31, 0x32, 0x33, 0x32, 0x30, 0x2b, 0x2b, 0x30, 0x31, 0x32, 0x34, 0x33, 0x32, 0x2f, 0x2a, 0x2c,
+	0x30, 0x33, 0x33, 0x33, 0x31, 0x2f, 0x28, 0x2c, 0x30, 0x33, 0x32, 0x33, 0x32, 0x30, 0x29, 0x2d,
+	0x30, 0x30, 0x31, 0x31, 0x2f, 0x2d, 0x23, 0x20, 0x61, 0x05, 0x00, 0x00, 0x80, 0xfd, 0x77, 0x00,
 	0x00, 0x00, 0x01
 };
 
@@ -179,18 +196,66 @@ static const uint8_t RS_GG[] = {
 };
 
 
+/// Which unit's calibration blank flash is seeded with.
+///
+/// Keyed off the cartridge's own game code rather than the ROM size, because
+/// that is what the override table already matches on: PEAJ is the original
+/// Card e-Reader, PSAJ the Card e-Reader+, PSAE the US e-Reader, which is +
+/// hardware. Anything unrecognised keeps the original, which is what every
+/// build before this one seeded unconditionally.
+static const uint8_t* _eReaderCalibration(struct GBACartEReader* ereader, size_t* size) {
+	const struct GBA* gba = ereader->p;
+	if (gba->memory.rom && gba->memory.romSize >= 0xB0) {
+		const char* code = (const char*) gba->memory.rom + 0xAC;
+		if (memcmp(code, "PSAJ", 4) == 0 || memcmp(code, "PSAE", 4) == 0) {
+			*size = sizeof(EREADER_CALIBRATION_TEMPLATE_PLUS);
+			return EREADER_CALIBRATION_TEMPLATE_PLUS;
+		}
+	}
+	*size = sizeof(EREADER_CALIBRATION_TEMPLATE);
+	return EREADER_CALIBRATION_TEMPLATE;
+}
+
+/// Put a factory-calibrated, formatted flash under the reader, if it is blank.
+///
+/// Called lazily rather than once from init, and that is load-bearing: the
+/// savedata buffer alive when the override is applied is NOT the one the game
+/// ends up running against. GBASavedataForceType reaches GBASavedataInitFlash,
+/// which with no backing file allocates a fresh anonymous map and erases it to
+/// 0xFF, and a frontend that hands the core a save later replaces the pointer
+/// again. Seeding at init therefore wrote calibration into a buffer nothing
+/// would ever read; doing it on first contact with the scanner writes into the
+/// one the game has.
+void GBACartEReaderSeedCalibration(struct GBACartEReader* ereader) {
+	uint8_t* flash = ereader->p->memory.savedata.data;
+	if (!flash || ereader->p->memory.savedata.type != GBA_SAVEDATA_FLASH1M) {
+		return;
+	}
+	size_t calSize;
+	const uint8_t* cal = _eReaderCalibration(ereader, &calSize);
+	if (flash[0xD000] == 0xFF) {
+		memset(&flash[0xD000], 0, 0x1000);
+		memcpy(&flash[0xD000], cal, calSize);
+	}
+	if (flash[0xE000] == 0xFF) {
+		memset(&flash[0xE000], 0, 0x1000);
+		memcpy(&flash[0xE000], cal, calSize);
+	}
+	// A real e-Reader's flash carries 128 zeroed bytes at the end of each 64 KiB
+	// bank, where erased flash reads 0xFF. That is what makes a bank look
+	// formatted rather than blank.
+	if (flash[0xFF80] == 0xFF) {
+		memset(&flash[0xFF80], 0, 0x80);
+	}
+	if (flash[0x1FF80] == 0xFF) {
+		memset(&flash[0x1FF80], 0, 0x80);
+	}
+}
+
 void GBACartEReaderInit(struct GBACartEReader* ereader) {
 	ereader->p->memory.hw.devices |= HW_EREADER;
 	_eReaderReset(ereader);
-
-	if (ereader->p->memory.savedata.data[0xD000] == 0xFF) {
-		memset(&ereader->p->memory.savedata.data[0xD000], 0, 0x1000);
-		memcpy(&ereader->p->memory.savedata.data[0xD000], EREADER_CALIBRATION_TEMPLATE, sizeof(EREADER_CALIBRATION_TEMPLATE));
-	}
-	if (ereader->p->memory.savedata.data[0xE000] == 0xFF) {
-		memset(&ereader->p->memory.savedata.data[0xE000], 0, 0x1000);
-		memcpy(&ereader->p->memory.savedata.data[0xE000], EREADER_CALIBRATION_TEMPLATE, sizeof(EREADER_CALIBRATION_TEMPLATE));
-	}
+	GBACartEReaderSeedCalibration(ereader);
 }
 
 void GBACartEReaderDeinit(struct GBACartEReader* ereader) {
@@ -580,6 +645,7 @@ void _eReaderReset(struct GBACartEReader* ereader) {
 void _eReaderWriteControl0(struct GBACartEReader* ereader, uint8_t value) {
 	EReaderControl0 control = value & 0x7F;
 	EReaderControl0 oldControl = ereader->registerControl0;
+	GBACartEReaderSeedCalibration(ereader);
 	if (ereader->state == EREADER_SERIAL_INACTIVE) {
 		if (EReaderControl0IsClock(oldControl) && EReaderControl0IsData(oldControl) && !EReaderControl0IsData(control)) {
 			ereader->state = EREADER_SERIAL_STARTING;

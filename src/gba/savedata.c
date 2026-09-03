@@ -7,6 +7,7 @@
 
 #include <mgba/internal/arm/macros.h>
 #include <mgba/internal/defines.h>
+#include <mgba/internal/gba/cart/ereader.h>
 #include <mgba/internal/gba/gba.h>
 #include <mgba/internal/gba/serialize.h>
 
@@ -291,6 +292,14 @@ void GBASavedataInitFlash(struct GBASavedata* savedata) {
 	savedata->currentBank = savedata->data;
 	if (end < GBA_SIZE_FLASH512) {
 		memset(&savedata->data[end], 0xFF, flashSize - end);
+	}
+
+	// An e-Reader keeps its scanner calibration in this flash, and the override
+	// that switches the reader on runs BEFORE this: the buffer it seeded is the
+	// one just replaced above. Re-seed here, where the buffer the game will
+	// actually read finally exists, or the reader comes up uncalibrated.
+	if (savedata->p && (savedata->p->memory.hw.devices & HW_EREADER)) {
+		GBACartEReaderSeedCalibration(&savedata->p->memory.ereader);
 	}
 
 	mCALLBACKS_INVOKE(savedata->p, memoryBlocksChanged);
