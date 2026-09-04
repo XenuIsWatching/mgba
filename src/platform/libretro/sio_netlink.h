@@ -137,6 +137,9 @@ struct GBASIONetlink {
 
 	bool transferActive;
 	uint64_t finishTick;
+	/* After a child's multiplayer completion, allow its serial IRQ handler one
+	 * scheduler grain to publish the next SIOMLT_SEND word. */
+	uint64_t wordReadyTick;
 	uint16_t multiData[MAX_GBAS];
 
 	/* Normal mode's words, indexed the same way. Kept apart from multiData

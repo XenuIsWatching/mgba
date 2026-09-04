@@ -91,15 +91,16 @@
  * slow baud would be invalidated by that write; sizing to the fastest means the
  * real transfer is only ever longer than the one planned for.
  *
- * Half of the shortest. The mechanism only needs the horizon to fit
- * inside the transfer: the master announces at commit = now + horizon, and the
- * barrier lets a peer reach that horizon "and not one tick further", so a child
- * lands exactly ON the commit tick, latches its word and sends. The master can
- * only reach the transfer's finish once the child has published far enough for
- * it to, which is commit + cycles - horizon >= commit whenever horizon <= cycles.
- * Half leaves the other half in hand while cutting steady-state rendezvous in
- * half. This matters on four-core mobile systems, where condition-variable
- * traffic rather than GBA emulation is the limiting cost.
+ * One sixteenth of the shortest. The mechanism only needs the horizon to fit
+ * inside the transfer: the master announces at commit = now + horizon, and a
+ * peer reaches that horizon before latching its word. The master can only reach
+ * the transfer's finish once the child has published far enough for it to,
+ * which is commit + cycles - horizon >= commit whenever horizon <= cycles.
+ * Half was fast, but it added 50 percent to every back-to-back transfer. The
+ * e-Reader protocol has a fixed receive deadline and consistently aborted an
+ * otherwise correct 999-word card at word 863; one eighth still reached only
+ * word 984. One sixteenth keeps the commit delay inside that deadline while
+ * retaining a useful rendezvous grain.
  *
  * Never below NETLINK_GRAIN, so a pair can never end up finer than it is today.
  */
@@ -160,7 +161,7 @@ static uint64_t _grainForMulti(struct GBASIONetlink* nl) {
 		return NETLINK_GRAIN;
 	}
 
-	grain = (uint64_t) cycles / 2;
+	grain = (uint64_t) cycles / 16;
 	return grain < NETLINK_GRAIN ? NETLINK_GRAIN : grain;
 }
 
@@ -727,15 +728,46 @@ static void _pumpJoy(struct GBASIONetlink* nl) {
 }
 
 
+static bool _transferDataComplete(struct GBASIONetlink* nl) {
+	return nl->peers >= 2 && nl->peers <= MAX_GBAS &&
+	       nl->received == ((1u << nl->peers) - 1u);
+}
+
+static void _latchPendingStart(struct GBASIONetlink* nl) {
+	uint32_t word;
+	uint64_t now = _now(nl);
+	if (!nl->pendingStart || now < nl->pendingTick || now < nl->wordReadyTick) {
+		return;
+	}
+
+	nl->pendingStart = false;
+	word = _localWord(nl);
+	_storeWord(nl, (unsigned) nl->selfId, word);
+	_send(nl, now, NL_XFER_DATA, word, 0);
+}
+
+
 static void _pump(struct GBASIONetlink* nl, uint32_t cyclesLate) {
 	uint8_t msg[NL_MSG_SIZE];
 	uint64_t tick;
 	unsigned from;
 	size_t len = sizeof(msg);
 
+	/* recv() deliberately exposes future-stamped messages so a core can book
+	 * their events. Do not, however, drain the NEXT transfer while this one is
+	 * still awaiting its completion interrupt. Doing that replaces the child's
+	 * scheduled completion before its program can write the following word. */
+	if (nl->transferActive && _transferDataComplete(nl)) {
+		return;
+	}
+
 	while (nl->link->recv(nl->handle, &tick, &from, msg, &len)) {
 		if (len == NL_MSG_SIZE) {
 			_handleMessage(nl, msg, tick, from, cyclesLate);
+			_latchPendingStart(nl);
+			if (nl->transferActive && _transferDataComplete(nl)) {
+				break;
+			}
 		}
 		len = sizeof(msg);
 	}
@@ -828,6 +860,7 @@ void GBASIONetlinkCreate(struct GBASIONetlink* nl, const struct retro_link_inter
 	nl->syncGrain = NETLINK_GRAIN;
 	nl->publishedSafeUntil = 0;
 	nl->activeUntil = 0;
+	nl->wordReadyTick = 0;
 	nl->mode = (enum GBASIOMode) -1;
 	memset(nl->multiData, 0xFF, sizeof(nl->multiData));
 }
@@ -880,6 +913,7 @@ static void GBASIONetlinkReset(struct GBASIODriver* driver) {
 	struct GBASIONetlink* nl = (struct GBASIONetlink*) driver;
 	nl->transferActive = false;
 	nl->pendingStart = false;
+	nl->wordReadyTick = 0;
 	nl->received = 0;
 	memset(nl->multiData, 0xFF, sizeof(nl->multiData));
 
@@ -920,6 +954,7 @@ static void GBASIONetlinkSetMode(struct GBASIODriver* driver, enum GBASIOMode mo
 	 * blind, which is a whole normal-mode transfer. */
 	nl->transferActive = false;
 	nl->pendingStart = false;
+	nl->wordReadyTick = 0;
 	nl->received = 0;
 	nl->syncGrain = _schedulingGrain(nl, mode, _now(nl));
 	if (nl->d.p && nl->d.p->p) {
@@ -1147,9 +1182,8 @@ static void GBASIONetlinkFinishMultiplayer(struct GBASIODriver* driver, uint16_t
 	struct GBASIONetlink* nl = (struct GBASIONetlink*) driver;
 	unsigned i;
 
-	nl->transferActive = false;
-
 	if (nl->peers < 2) {
+		nl->transferActive = false;
 		memset(data, 0xFF, sizeof(uint16_t) * 4);
 		return;
 	}
@@ -1169,6 +1203,13 @@ static void GBASIONetlinkFinishMultiplayer(struct GBASIODriver* driver, uint16_t
 		mLOG(GBA_SIO, DEBUG, "netlink: id %i short: got %02X want %02X", nl->selfId, nl->received, (1u << nl->peers) - 1);
 	}
 
+	nl->transferActive = false;
+	/* The serial IRQ raised by this completion is what prompts a child to write
+	 * its next SIOMLT_SEND word. Do not let a future-stamped START latch that
+	 * register until the CPU has had one scheduling grain to run the handler. */
+	if (nl->selfId != 0) {
+		nl->wordReadyTick = _now(nl) + nl->syncGrain;
+	}
 	nl->received = 0;
 	memset(nl->multiData, 0xFF, sizeof(nl->multiData));
 }
@@ -1230,7 +1271,6 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 	_updateMultibootReady(nl);
 	uint64_t now = _now(nl);
 	uint64_t grant;
-	uint32_t word;
 	uint32_t wakeFlags = RETRO_LINK_WAKE_NONE;
 	int32_t step;
 
@@ -1250,12 +1290,7 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 	_pump(nl, cyclesLate);
 
 	/* Latch this machine's half once its clock reaches the transfer's start. */
-	if (nl->pendingStart && now >= nl->pendingTick) {
-		nl->pendingStart = false;
-		word = _localWord(nl);
-		_storeWord(nl, (unsigned) nl->selfId, word);
-		_send(nl, now, NL_XFER_DATA, word, 0);
-	}
+	_latchPendingStart(nl);
 
 	/* Membership is checked here as well as on the paths the guest drives,
 	 * because a cable seated while the game is not touching its serial port has
@@ -1295,6 +1330,10 @@ static void _netlinkEvent(struct mTiming* timing, void* context, uint32_t cycles
 
 	if (grant != RETRO_LINK_UNBOUNDED && grant > now && grant - now < (uint64_t) step) {
 		step = (int32_t) (grant - now);
+	}
+	if (nl->pendingStart && nl->wordReadyTick > now &&
+	    nl->wordReadyTick - now < (uint64_t) step) {
+		step = (int32_t) (nl->wordReadyTick - now);
 	}
 
 	step -= (int32_t) cyclesLate;
