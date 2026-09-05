@@ -28,7 +28,8 @@ void GBACartEReaderSeedCalibration(struct GBACartEReader* ereader);
 static void _eReaderWriteControl1(struct GBACartEReader* ereader, uint8_t value);
 static void _eReaderReadData(struct GBACartEReader* ereader);
 static void _eReaderReedSolomon(const uint8_t* input, uint8_t* output);
-static void _eReaderScanCard(struct GBACartEReader* ereader);
+static void _eReaderDropCard(struct GBACartEReader* ereader);
+static void _eReaderTakeCard(struct GBACartEReader* ereader);
 
 const int EREADER_NYBBLE_5BIT[16][5] = {
 	{ 0, 0, 0, 0, 0 },
@@ -259,19 +260,7 @@ void GBACartEReaderInit(struct GBACartEReader* ereader) {
 }
 
 void GBACartEReaderDeinit(struct GBACartEReader* ereader) {
-	if (ereader->dots) {
-		mappedMemoryFree(ereader->dots, EREADER_DOTCODE_SIZE);
-		ereader->dots = NULL;
-	}
-	int i;
-	for (i = 0; i < EREADER_CARDS_MAX; ++i) {
-		if (!ereader->cards[i].data) {
-			continue;
-		}
-		free(ereader->cards[i].data);
-		ereader->cards[i].data = NULL;
-		ereader->cards[i].size = 0;
-	}
+	_eReaderDropCard(ereader);
 }
 
 void GBACartEReaderWrite(struct GBACartEReader* ereader, uint32_t address, uint16_t value) {
@@ -722,10 +711,19 @@ void _eReaderWriteControl0(struct GBACartEReader* ereader, uint8_t value) {
 		control = EReaderControl0ClearData(control);
 	}
 	ereader->registerControl0 = control;
+	if (EReaderControl0IsPowerEnable(oldControl) && !EReaderControl0IsPowerEnable(control)) {
+		// The scanner has stopped asking, so the card leaves with it: one power-up
+		// is one card. Nothing is kept for whenever the reader next wakes up --
+		// that is the queue this was written to be rid of -- and nothing is left
+		// under the head either, or the next scan would read the last player's
+		// card instead of finding the scanner bare.
+		_eReaderDropCard(ereader);
+	}
 	if (!EReaderControl0IsScan(oldControl) && EReaderControl0IsScan(control)) {
-		if (ereader->scanX > 0) {
-			_eReaderScanCard(ereader);
-		}
+		// The top of a sweep: a waiting card can go under the head here without
+		// spoiling anything, and scanX/scanY are reset just below, so the head
+		// starts it cleanly at its top edge.
+		_eReaderTakeCard(ereader);
 		ereader->scanX = 0;
 		ereader->scanY = 0;
 	} else if (EReaderControl0IsLedEnable(control) && EReaderControl0IsScan(control) && !EReaderControl1IsScanline(ereader->registerControl1)) {
@@ -741,7 +739,7 @@ void _eReaderWriteControl1(struct GBACartEReader* ereader, uint8_t value) {
 		++ereader->scanY;
 		if (ereader->scanY == (ereader->serial[0x15] | (ereader->serial[0x14] << 8))) {
 			ereader->scanY = 0;
-			if (ereader->scanX < 4050) {
+			if (ereader->scanX < EREADER_SCAN_END) {
 				ereader->scanX += 210;
 			}
 		}
@@ -752,8 +750,10 @@ void _eReaderWriteControl1(struct GBACartEReader* ereader, uint8_t value) {
 
 void _eReaderReadData(struct GBACartEReader* ereader) {
 	memset(ereader->data, 0, EREADER_BLOCK_SIZE);
+	// A read with nothing under the head. If a card is waiting it can go on now
+	// -- there is no read in progress for it to spoil.
 	if (!ereader->dots) {
-		_eReaderScanCard(ereader);
+		_eReaderTakeCard(ereader);
 	}
 	if (ereader->dots) {
 		int y = ereader->scanY - 10;
@@ -796,34 +796,65 @@ void _eReaderReadData(struct GBACartEReader* ereader) {
 }
 
 
-void _eReaderScanCard(struct GBACartEReader* ereader) {
+// Everything on the scanner goes: the card under the head and any waiting to
+// take its place. The software reads a bare scanner until somebody swipes again.
+void _eReaderDropCard(struct GBACartEReader* ereader) {
 	if (ereader->dots) {
-		memset(ereader->dots, 0, EREADER_DOTCODE_SIZE);
+		mappedMemoryFree(ereader->dots, EREADER_DOTCODE_SIZE);
+		ereader->dots = NULL;
 	}
-	int i;
-	for (i = 0; i < EREADER_CARDS_MAX; ++i) {
-		if (!ereader->cards[i].data) {
-			continue;
-		}
-		GBACartEReaderScan(ereader, ereader->cards[i].data, ereader->cards[i].size);
-		free(ereader->cards[i].data);
-		ereader->cards[i].data = NULL;
-		ereader->cards[i].size = 0;
-		break;
+	if (ereader->pendingDots) {
+		mappedMemoryFree(ereader->pendingDots, EREADER_DOTCODE_SIZE);
+		ereader->pendingDots = NULL;
 	}
 }
 
+// The waiting card goes under the head, which starts at the top of it. Called at
+// the only two moments a card can arrive without spoiling a read: the top of a
+// sweep, and a read that finds no card there at all.
+void _eReaderTakeCard(struct GBACartEReader* ereader) {
+	if (!ereader->pendingDots) {
+		return;
+	}
+	if (ereader->dots) {
+		mappedMemoryFree(ereader->dots, EREADER_DOTCODE_SIZE);
+	}
+	ereader->dots = ereader->pendingDots;
+	ereader->pendingDots = NULL;
+	ereader->scanX = -24;
+}
+
+// A card offered to the scanner. It is laid on the reader THERE AND THEN or not
+// at all: a card offered to a scanner that is not powered up is dropped, exactly
+// as one swiped past a reader sitting on a title screen would be, and one
+// offered while another is still waiting takes its place. Nothing is held for a
+// later scan, and the frontend gets no answer either way -- nothing about the
+// gesture depends on one, and a card that silently does nothing is the
+// hardware's own behaviour.
 void GBACartEReaderQueueCard(struct GBA* gba, const void* data, size_t size) {
 	struct GBACartEReader* ereader = &gba->memory.ereader;
-	int i;
-	for (i = 0; i < EREADER_CARDS_MAX; ++i) {
-		if (ereader->cards[i].data) {
-			continue;
-		}
-		ereader->cards[i].data = malloc(size);
-		memcpy(ereader->cards[i].data, data, size);
-		ereader->cards[i].size = size;
+	if (!EReaderControl0IsPowerEnable(ereader->registerControl0)) {
 		return;
+	}
+	// Decode into the spare buffer rather than the one the head may be reading.
+	// The scan writes through `dots` and resets scanX, so it is lent both and
+	// given them back; there is no second decoder to call and no reason for one.
+	// _eReaderTakeCard is what puts the result under the head, and it waits for a
+	// moment that will not spoil a read in progress -- a card dropped onto a
+	// sweep already part way down the strip rewinds the head mid-read, and the
+	// software makes nonsense of what comes back. That cost a two-strip card its
+	// second strip, silently, while looking for a while like a card read twice.
+	uint8_t* live = ereader->dots;
+	int liveX = ereader->scanX;
+	ereader->dots = ereader->pendingDots;
+	GBACartEReaderScan(ereader, data, size);
+	ereader->pendingDots = ereader->dots;
+	ereader->dots = live;
+	ereader->scanX = liveX;
+	// Nothing is being read: the head can have it at once. This is the path a
+	// card swiped into a waiting reader takes, and the common one.
+	if (!ereader->dots) {
+		_eReaderTakeCard(ereader);
 	}
 }
 

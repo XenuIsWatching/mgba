@@ -65,9 +65,11 @@ void EReaderDiskReset(void) {
 }
 
 static bool _erSetEject(bool ejected) {
-	/* Closing on a loaded strip is the scan. GBACartEReaderQueueCard copies the
-	 * buffer into its own 16-slot queue, which the game drains as it asks for
-	 * cards, so this neither blocks nor needs the game to be ready. */
+	/* Closing on a loaded strip IS the scan, and it happens now: the strip is
+	 * decoded straight into the reader's dot buffer and read on the scan pass
+	 * that follows. A card offered while the scanner is unpowered -- the game is
+	 * not asking for one -- is dropped rather than held, so a swipe made at the
+	 * wrong moment does nothing instead of firing later on its own. */
 	if (!ejected && eEjected && eCore && eIndex < eCount) {
 		struct EReaderStrip* strip = &eStrips[eIndex];
 		if (strip->data && strip->size) {

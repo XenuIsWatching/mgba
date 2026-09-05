@@ -16,7 +16,9 @@ struct GBACartridgeHardware;
 
 #define EREADER_DOTCODE_STRIDE 1420
 #define EREADER_DOTCODE_SIZE (EREADER_DOTCODE_STRIDE * 40)
-#define EREADER_CARDS_MAX 16
+// Where the head stops. scanX advances a column at a time up to this and then
+// stays, so a sweep sitting here has run out of strip to read.
+#define EREADER_SCAN_END 4050
 
 DECL_BITFIELD(EReaderControl0, uint8_t);
 DECL_BIT(EReaderControl0, Data, 0);
@@ -52,11 +54,6 @@ enum EReaderCommand {
 	EREADER_COMMAND_READ_DATA = 0x23,
 };
 
-struct EReaderCard {
-	void* data;
-	size_t size;
-};
-
 struct GBA;
 struct GBACartEReader {
 	struct GBA* p;
@@ -76,7 +73,13 @@ struct GBACartEReader {
 	int scanX;
 	int scanY;
 	uint8_t* dots;
-	struct EReaderCard cards[EREADER_CARDS_MAX];
+	// A card lying on the scanner that the head has not started on yet. It
+	// becomes `dots` at the top of a sweep, or at a read that finds the head
+	// bare. Decoding straight into `dots` instead would rewrite the strip under
+	// a sweep already halfway down it, which the software reads as a card it
+	// cannot make sense of. Both go when the scanner powers down: one power-up
+	// is one card. See _eReaderWriteControl0.
+	uint8_t* pendingDots;
 };
 
 struct EReaderAnchor;

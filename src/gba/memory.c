@@ -98,7 +98,7 @@ void GBAMemoryInit(struct GBA* gba) {
 
 	gba->memory.ereader.p = gba;
 	gba->memory.ereader.dots = NULL;
-	memset(gba->memory.ereader.cards, 0, sizeof(gba->memory.ereader.cards));
+	gba->memory.ereader.pendingDots = NULL;
 }
 
 void GBAMemoryDeinit(struct GBA* gba) {
